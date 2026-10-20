@@ -14,6 +14,8 @@ after graft: A---B---E---F (upstream 1.4)
                            C'--D'  (your changes, replayed)
 ```
 
+![Graft review](docs/graft-review.png)
+
 ## What's here
 
 - `bin/` — the CLI, installed into `~/.local/bin`:
@@ -57,6 +59,13 @@ Why this matters: cloning your own fork from GitHub creates only an
 `origin` remote — git on your machine knows nothing about GitHub's
 fork relationship, so without an `upstream` remote graft would treat your
 fork as the creator repo and never see the original's changes.
+
+![Setup wizard](docs/setup-wizard.png)
+
+The bar badge is driven by the survey, which reports each plugin's state
+in one line (`omarchy-plugin-diverged`):
+
+![Diverged survey](docs/diverged.png)
 
 ## Install
 
