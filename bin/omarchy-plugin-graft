@@ -49,9 +49,23 @@ valid_plugin_id() {
   [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $1 != *..* ]]
 }
 
+# The remote ref standing for "the original creator's default branch tip".
+# A remote literally named upstream IS the fork declaration, even before its
+# tracking refs exist (the wizard adds it; a fetch may have failed) — graft
+# then fetches that remote name directly. Fallbacks cover plain clones.
 upstream_ref() {
   local dir="$1" ref=""
-  for ref in refs/remotes/upstream/HEAD refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master; do
+  if git -C "$dir" remote get-url upstream >/dev/null 2>&1; then
+    for ref in refs/remotes/upstream/HEAD refs/remotes/upstream/main refs/remotes/upstream/master; do
+      if [[ -n $(git -C "$dir" rev-parse --verify --quiet "$ref" 2>/dev/null) ]]; then
+        echo "$ref"
+        return 0
+      fi
+    done
+    echo "refs/remotes/upstream/HEAD"
+    return 0
+  fi
+  for ref in refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master; do
     if [[ -n $(git -C "$dir" rev-parse --verify --quiet "$ref" 2>/dev/null) ]]; then
       echo "$ref"
       return 0
@@ -204,6 +218,10 @@ while (( $# > 0 )); do
   case "$1" in
   --yes | -y)
     ASSUME_YES=1
+    shift
+    ;;
+  --all)
+    id="--all"
     shift
     ;;
   -h | --help)

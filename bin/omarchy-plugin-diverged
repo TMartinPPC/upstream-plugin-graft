@@ -27,9 +27,23 @@ valid_plugin_id() {
 }
 
 # The remote ref standing for "the original creator's default branch tip".
+# A remote literally named upstream IS the fork declaration; its tracking
+# refs may not exist yet (added by the wizard, fetch failed), in which case
+# the placeholder ref is reported and the survey flags the plugin as
+# unresolved until a graft fetches and records the tip.
 upstream_ref() {
   local dir="$1" ref=""
-  for ref in refs/remotes/upstream/HEAD refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master; do
+  if git -C "$dir" remote get-url upstream >/dev/null 2>&1; then
+    for ref in refs/remotes/upstream/HEAD refs/remotes/upstream/main refs/remotes/upstream/master; do
+      if [[ -n $(git -C "$dir" rev-parse --verify --quiet "$ref" 2>/dev/null) ]]; then
+        echo "$ref"
+        return 0
+      fi
+    done
+    echo "refs/remotes/upstream/HEAD"
+    return 0
+  fi
+  for ref in refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master; do
     if [[ -n $(git -C "$dir" rev-parse --verify --quiet "$ref" 2>/dev/null) ]]; then
       echo "$ref"
       return 0
@@ -48,6 +62,11 @@ survey_one() {
   [[ -d $dir/.git/rebase-merge || -d $dir/.git/rebase-apply ]] && rebasing=1
 
   if up=$(upstream_ref "$dir"); then
+    if [[ -z $(git -C "$dir" rev-parse --verify --quiet "$up" 2>/dev/null) ]]; then
+      # Declared upstream whose tracking refs were never fetched.
+      printf '%s\tunknown\t0\t%d\t%d\n' "$1" "$dirty" "$rebasing"
+      return 0
+    fi
     ahead=$(git -C "$dir" rev-list --count "$up..HEAD" 2>/dev/null) || ahead=0
     printf '%s\t%s\t%d\t%d\t%d\n' "$1" "$up" "$ahead" "$dirty" "$rebasing"
   else
@@ -118,17 +137,25 @@ fi
 
 needs=0
 if (( AS_JSON )); then
+  # Collect in the main shell: a for|jq pipeline would run the loop in a
+  # subshell and lose the needs counter (and thus the exit code).
+  records=()
   for id in "${ids[@]}"; do
     IFS=$'\t' read -r id up ahead dirty rebasing <<<"$(survey_one "$id")"
-    if (( dirty || rebasing || ahead > 0 )); then
-      json_record "$id" "$up" "$ahead" "$dirty" "$rebasing"
+    if (( dirty || rebasing || ahead > 0 )) || [[ $up == unknown ]]; then
+      records+=("$(json_record "$id" "$up" "$ahead" "$dirty" "$rebasing")")
       needs=$((needs + 1))
     fi
-  done | jq -s '.'
+  done
+  if (( ${#records[@]} > 0 )); then
+    printf '%s\n' "${records[@]}" | jq -s 'sort_by(.id)'
+  else
+    echo '[]'
+  fi
 else
   for id in "${ids[@]}"; do
     IFS=$'\t' read -r id up ahead dirty rebasing <<<"$(survey_one "$id")"
-    if (( dirty || rebasing || ahead > 0 )); then
+    if (( dirty || rebasing || ahead > 0 )) || [[ $up == unknown ]]; then
       text_record "$id" "$up" "$ahead" "$dirty" "$rebasing"
       needs=$((needs + 1))
     fi
