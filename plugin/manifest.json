@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.tmartinppc.plugin-graft",
+  "name": "Plugin Graft",
+  "version": "0.1.0",
+  "author": "Tom Martin",
+  "license": "MIT",
+  "description": "Bar widget showing Omarchy plugins that carry local commits and drift from upstream. Click to graft the original creator's changes onto your copies.",
+  "homepage": "https://github.com/TMartinPPC/upstream-plugin-graft",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Plugin Graft",
+    "description": "Diverged plugin count; click opens the graft terminal flow.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

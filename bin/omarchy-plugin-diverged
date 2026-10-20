@@ -1,0 +1,144 @@
+#!/bin/bash
+
+# omarchy:summary=List Omarchy plugins with local commits or unwritten changes
+# omarchy:group=plugin
+# omarchy:args=[--json] [id...]
+
+# Surveys git-managed third-party plugins in ~/.config/omarchy/plugins that have
+# diverged from their clone point: local commits, an unclean working tree, or a
+# paused rebase. Purely local — git status and rev-list only, no fetch — so it
+# is fast enough for a bar widget to run on every shell start. Plugin authors
+# with a fork setup keep their creator repo on a remote named upstream; see
+# omarchy-plugin-fork. Upstream here always means "the remote that tracks the
+# original creator's default branch tip".
+
+set -euo pipefail
+
+PLUGINS_DIR="${OMARCHY_PLUGINS_DIR:-$HOME/.config/omarchy/plugins}"
+AS_JSON=0
+
+fail() {
+  echo "omarchy-plugin-diverged: $*" >&2
+  exit 2
+}
+
+valid_plugin_id() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $1 != *..* ]]
+}
+
+# The remote ref standing for "the original creator's default branch tip".
+upstream_ref() {
+  local dir="$1" ref=""
+  for ref in refs/remotes/upstream/HEAD refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master; do
+    if [[ -n $(git -C "$dir" rev-parse --verify --quiet "$ref" 2>/dev/null) ]]; then
+      echo "$ref"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Prints: id \t upstream-ref-or-unknown \t ahead \t dirty \t rebasing
+survey_one() {
+  local dir="$PLUGINS_DIR/$1" up="" ahead=0 dirty=0 rebasing=0
+
+  git -C "$dir" diff --quiet 2>/dev/null && git -C "$dir" diff --cached --quiet 2>/dev/null \
+    && [[ -z $(git -C "$dir" status --porcelain 2>/dev/null) ]] || dirty=1
+
+  [[ -d $dir/.git/rebase-merge || -d $dir/.git/rebase-apply ]] && rebasing=1
+
+  if up=$(upstream_ref "$dir"); then
+    ahead=$(git -C "$dir" rev-list --count "$up..HEAD" 2>/dev/null) || ahead=0
+    printf '%s\t%s\t%d\t%d\t%d\n' "$1" "$up" "$ahead" "$dirty" "$rebasing"
+  else
+    printf '%s\tunknown\t0\t%d\t%d\n' "$1" "$dirty" "$rebasing"
+  fi
+}
+
+text_record() {
+  local id="$1" up="$2" ahead="$3" dirty="$4" rebasing="$5"
+  local parts=()
+  if [[ $up == unknown ]]; then
+    parts=("cannot resolve an upstream ref")
+  fi
+  (( rebasing )) && parts+=("graft paused mid-rebase")
+  (( dirty )) && parts+=("uncommitted changes")
+  (( ahead > 0 )) && parts+=("$ahead local commit$([ "$ahead" = 1 ] || echo s) on top of ${up#refs/remotes/}")
+  echo "$id: ${parts[0]}${parts[1]:+; ${parts[1]}}${parts[2]:+; ${parts[2]}}"
+}
+
+json_record() {
+  jq -cn --arg id "$1" --arg upstream "$2" --arg ahead "$3" \
+    --arg dirty "$4" --arg rebasing "$5" '
+    { id: $id, upstream: $upstream, ahead: ($ahead | tonumber),
+      dirty: ($dirty == "1"), rebaseInProgress: ($rebasing == "1") }'
+}
+
+ids=()
+while (( $# > 0 )); do
+  case "$1" in
+  --json | -j)
+    AS_JSON=1
+    shift
+    ;;
+  -h | --help)
+    cat <<USAGE
+Usage: omarchy plugin diverged [--json] [id...]
+
+Surveys installed git-managed plugins for local commits, uncommitted
+changes, or a paused graft rebase. Purely local: no network. --json emits
+only the plugins that need attention. Exits 0 when at least one plugin
+needs attention, 1 when none do.
+USAGE
+    exit 0
+    ;;
+  -*)
+    fail "unknown option: $1"
+    ;;
+  *)
+    valid_plugin_id "$1" || fail "invalid plugin id '$1'"
+    [[ -d $PLUGINS_DIR/$1 ]] || fail "plugin '$1' is not installed"
+    [[ -d $PLUGINS_DIR/$1/.git ]] || fail "plugin '$1' is not a git checkout"
+    ids+=("$1")
+    shift
+    ;;
+  esac
+done
+
+[[ -d $PLUGINS_DIR ]] || fail "no plugins installed at $PLUGINS_DIR"
+
+if (( ${#ids[@]} == 0 )); then
+  for dir in "$PLUGINS_DIR"/*/; do
+    [[ -d $dir/.git ]] || continue
+    ids+=("$(basename "$dir")")
+  done
+fi
+
+[[ ${#ids[@]} -gt 0 ]] || (echo "No git-managed plugins installed."; exit 1)
+
+needs=0
+if (( AS_JSON )); then
+  for id in "${ids[@]}"; do
+    IFS=$'\t' read -r id up ahead dirty rebasing <<<"$(survey_one "$id")"
+    if (( dirty || rebasing || ahead > 0 )); then
+      json_record "$id" "$up" "$ahead" "$dirty" "$rebasing"
+      needs=$((needs + 1))
+    fi
+  done | jq -s '.'
+else
+  for id in "${ids[@]}"; do
+    IFS=$'\t' read -r id up ahead dirty rebasing <<<"$(survey_one "$id")"
+    if (( dirty || rebasing || ahead > 0 )); then
+      text_record "$id" "$up" "$ahead" "$dirty" "$rebasing"
+      needs=$((needs + 1))
+    fi
+  done
+  if (( needs == 0 )); then
+    echo "All plugins are in sync."
+  fi
+fi
+
+if (( needs > 0 )); then
+  exit 0
+fi
+exit 1

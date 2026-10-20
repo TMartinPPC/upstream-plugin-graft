@@ -1,0 +1,259 @@
+#!/bin/bash
+
+# omarchy:summary=Set up fork relationships so graft can find each plugin's original creator
+# omarchy:group=plugin
+# omarchy:args=[id] [--yes]
+
+# Two modes:
+#
+#   omarchy-plugin-fork            (no id) setup wizard. Surveys every
+#       git-managed plugin and classifies it: already has an upstream
+#       remote, or origin is a GitHub fork whose parent is auto-detected
+#       via the GitHub API (no typing needed), or needs a manually
+#       entered upstream URL. The user picks which fixes to apply.
+#       This is the intended first-launch step after installing graft.
+#
+#   omarchy-plugin-fork <id>       escape hatch. Forks the plugin's origin
+#       repo on GitHub (gh repo fork), renames origin to upstream, points
+#       origin at the fresh fork, and pushes local commits. From then on
+#       vanilla `omarchy plugin update` follows the fork while
+#       omarchy-plugin-graft follows the creator.
+#
+# Fork detection has no omarchy-side metadata; it lives entirely in the
+# plugin folder's git remotes. A remote literally named "upstream" IS the
+# declaration "the original creator lives here".
+
+set -euo pipefail
+
+PLUGINS_DIR="${OMARCHY_PLUGINS_DIR:-$HOME/.config/omarchy/plugins}"
+ASSUME_YES=0
+
+fail() {
+  echo "omarchy-plugin-fork: $*" >&2
+  exit 1
+}
+
+interactive() {
+  [[ -t 0 && -t 1 ]]
+}
+
+confirm() {
+  local prompt="$1"
+  (( ASSUME_YES )) && return 0
+  if interactive; then
+    gum confirm "$prompt"
+  else
+    fail "refusing to continue without confirmation; pass --yes"
+  fi
+}
+
+valid_plugin_id() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $1 != *..* ]]
+}
+
+# "https://github.com/OWNER/REPO.git" | "git@github.com:OWNER/REPO.git" |
+# "ssh://git@github.com/OWNER/REPO" -> "OWNER/REPO" (empty on no match).
+github_repo_of_url() {
+  local url="${1%.git}"
+  if [[ $url =~ github\.com[:/]+([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)$ ]]; then
+    echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    return 0
+  fi
+  return 1
+}
+
+# Prints "1<TAB>PARENT" when the repo is a GitHub fork, "0<TAB>" otherwise.
+gh_repo_parent() {
+  gh api "repos/$1" --jq 'if .fork then "1\t" + (.parent.full_name // "") else "0\t" end' 2>/dev/null
+}
+
+add_upstream() {
+  local dir="$1" id="$2" url="$3"
+  git -C "$dir" remote add upstream "$url" ||
+    fail "could not add upstream remote for '$id'"
+  if git -C "$dir" fetch --quiet upstream 2>/dev/null; then
+    echo "Added upstream $url for $id (fetched)."
+  else
+    echo "Added upstream $url for $id (fetch failed; graft will retry on next run)." >&2
+  fi
+  echo "'omarchy-plugin-graft $id' now syncs against this upstream."
+}
+
+# ---- Mode 2: fork an existing plugin (escape hatch) ------------------------
+
+fork_one() {
+  local id="$1"
+  local dir="$PLUGINS_DIR/$id"
+  [[ -d $dir/.git ]] || fail "plugin '$id' is not a git checkout"
+  [[ -z $(git -C "$dir" remote get-url upstream 2>/dev/null) ]] ||
+    fail "'$id' already has an upstream remote; it is set up for grafting already"
+
+  command -v gh >/dev/null 2>&1 ||
+    fail "gh is required to fork; install it and run 'gh auth login' first"
+
+  local origin_url
+  origin_url=$(git -C "$dir" remote get-url origin 2>/dev/null) ||
+    fail "'$id' has no origin remote"
+
+  echo "Forking $origin_url ..."
+  gh repo fork "$origin_url" --clone=false ||
+    fail "could not fork $origin_url"
+
+  # gh repo fork --remote, run inside the plugin dir, does the rename dance
+  # for us: origin -> upstream, and your fresh fork becomes the new origin.
+  (cd "$dir" && gh repo fork --remote) ||
+    fail "could not wire up remotes; 'git remote -v' in $dir may need manual fixing"
+
+  echo "Remotes now:"
+  git -C "$dir" remote -v
+
+  echo
+  confirm "Push your local commits to the fork now?" || {
+    echo "Not pushed; run 'git push -u origin HEAD' in $dir when ready."
+    return 0
+  }
+  git -C "$dir" push -u origin HEAD ||
+    fail "push to the fork failed; run 'git push -u origin HEAD' in $dir"
+
+  echo
+  echo "Done. 'omarchy plugin update' now follows your fork; graft upstream changes with 'omarchy-plugin-graft $id'."
+}
+
+# ---- Mode 1: first-launch setup wizard -------------------------------------
+
+wizard() {
+  command -v gum >/dev/null 2>&1 || fail "gum is required for the setup wizard"
+
+  local has_gh=0
+  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    has_gh=1
+  fi
+
+  [[ -d $PLUGINS_DIR ]] || fail "no plugins installed at $PLUGINS_DIR"
+
+  echo "Plugin upstream review"
+  echo "----------------------"
+  echo "graft finds each plugin's original creator through a git remote"
+  echo "named 'upstream'. Plugins forked on GitHub and cloned without it"
+  echo "are invisible to graft. This wizard finds and fixes those."
+  (( has_gh )) || echo "(gh is not authenticated, so GitHub fork auto-detection is off;"
+  (( has_gh )) || echo " you can still enter upstream URLs manually, or 'gh auth login' first.)"
+  echo
+
+  # Each entry is "id<TAB>kind<TAB>target<TAB>display": kind is
+  # auto (target = detected parent repo), manual (target unused),
+  # info (target = the already-set upstream URL, display only).
+  local -a entries=()
+  local dir id origin_url repo info forked target
+
+  for dir in "$PLUGINS_DIR"/*/; do
+    [[ -d $dir/.git ]] || continue
+    id=$(basename "$dir")
+    origin_url=$(git -C "$dir" remote get-url origin 2>/dev/null) || origin_url=""
+
+    if target=$(git -C "$dir" remote get-url upstream 2>/dev/null); then
+      entries+=("$(printf '%s\tinfo\t%s\t✓ upstream set: %s' "$id" "$target" "$target")")
+      continue
+    fi
+
+    if (( has_gh )) && [[ -n $origin_url ]] && repo=$(github_repo_of_url "$origin_url"); then
+      if info=$(gh_repo_parent "$repo"); then
+        forked=${info%%$'\t'*}
+        target=${info#*$'\t'}
+        if [[ $forked == 1 && -n $target ]]; then
+          entries+=("$(printf '%s\tauto\t%s\t⚡ GitHub says %s is a fork of %s — fix it here' \
+            "$id" "$target" "$repo" "$target")")
+          continue
+        fi
+      fi
+    fi
+
+    entries+=("$(printf '%s\tmanual\t\t· no upstream remote — enter the creator URL manually' "$id")")
+  done
+
+  if (( ${#entries[@]} == 0 )); then
+    echo "No git-managed plugins found; nothing to review."
+    return 0
+  fi
+
+  while :; do
+    echo
+    local -a menu=()
+    local i
+    for i in "${!entries[@]}"; do
+      IFS=$'\t' read -r id kind target display <<<"${entries[$i]}"
+      menu+=("$i: $id — $display")
+    done
+    menu+=("── Done, exit the wizard")
+
+    local choice idx=-1
+    choice=$(printf '%s\n' "${menu[@]}" | gum choose --header "Which plugin needs an upstream?")
+    [[ $choice == "── Done, exit the wizard" ]] && return 0
+    idx=${choice%%:*}
+
+    IFS=$'\t' read -r id kind target display <<<"${entries[$idx]}"
+    case "$kind" in
+    info)
+      echo "Nothing to do for $id."
+      ;;
+    auto)
+      if confirm "Add upstream remote 'https://github.com/$target.git' for $id?"; then
+        add_upstream "$PLUGINS_DIR/$id" "$id" "https://github.com/$target.git"
+        entries[$idx]="$(printf '%s\tinfo\t%s\t✓ upstream set: https://github.com/%s.git' "$id" "$target" "$target")"
+      fi
+      ;;
+    manual)
+      local url
+      url=$(gum input --placeholder "https://github.com/creator/plugin-repo" --header "Upstream URL for $id") || true
+      [[ -n ${url:-} ]] || continue
+      if confirm "Add upstream remote '$url' for $id?"; then
+        add_upstream "$PLUGINS_DIR/$id" "$id" "$url"
+        entries[$idx]="$(printf '%s\tinfo\t%s\t✓ upstream set: %s' "$id" "$url" "$url")"
+      fi
+      ;;
+    esac
+  done
+}
+
+id=""
+
+while (( $# > 0 )); do
+  case "$1" in
+  --yes | -y)
+    ASSUME_YES=1
+    shift
+    ;;
+  -h | --help)
+    cat <<USAGE
+Usage: omarchy plugin fork            review fork/upstream setup for all plugins
+       omarchy plugin fork <id> [--yes]
+
+With no id: an interactive wizard that surveys every git-managed plugin and
+helps you declare where each one's original creator lives. Forks made on
+GitHub are detected automatically (via the GitHub API); anything else asks
+for a URL.
+
+With an id: forks the plugin's origin repo to your GitHub account, renames
+origin to upstream, points origin at your fork, and pushes your local
+commits. Afterwards vanilla 'omarchy plugin update' works against your
+fork, and 'omarchy-plugin-graft' syncs against the creator. Requires gh.
+USAGE
+    exit 0
+    ;;
+  -*)
+    fail "unknown fork option: $1"
+    ;;
+  *)
+    [[ -z $id ]] || fail "unexpected argument: $1"
+    id="$1"
+    shift
+    ;;
+  esac
+done
+
+if [[ -n $id ]]; then
+  valid_plugin_id "$id" || fail "invalid plugin id '$id'"
+  fork_one "$id"
+else
+  wizard
+fi

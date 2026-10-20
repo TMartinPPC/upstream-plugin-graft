@@ -1,0 +1,288 @@
+#!/bin/bash
+
+# omarchy:summary=Graft upstream changes onto locally-modified Omarchy plugins
+# omarchy:group=plugin
+# omarchy:args=<id | --all> [--yes]
+
+# `omarchy plugin update` refuses to fast-forward a plugin you have committed
+# to. This tool is the missing half: it fetches the original creator's default
+# branch tip and rebases YOUR local commits on top of it, so your changes stay
+# and upstream's arrive. When you have no local commits it behaves exactly like
+# `omarchy plugin update` (review diff, confirm, fast-forward). A conflict
+# pauses the rebase mid-flight; resolve the listed files, `git add` them, and
+# run this command again for the same plugin to continue.
+#
+# Plugin authors who pushed their work to a GitHub fork (see
+# omarchy-plugin-fork) keep the creator repo on a remote named upstream; graft
+# rebases onto that and force-with-lease pushes the rebased commits back to the
+# fork afterwards, so vanilla `omarchy plugin update` keeps working.
+
+set -euo pipefail
+
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}"
+
+PLUGINS_DIR="${OMARCHY_PLUGINS_DIR:-$HOME/.config/omarchy/plugins}"
+ASSUME_YES=0
+GRAFTED_ANY=0
+
+fail() {
+  echo "omarchy-plugin-graft: $*" >&2
+  exit 1
+}
+
+interactive() {
+  [[ -t 0 && -t 1 ]]
+}
+
+confirm() {
+  local prompt="$1"
+  (( ASSUME_YES )) && return 0
+  if interactive; then
+    gum confirm "$prompt"
+  else
+    fail "refusing to continue without confirmation; pass --yes"
+  fi
+}
+
+valid_plugin_id() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $1 != *..* ]]
+}
+
+upstream_ref() {
+  local dir="$1" ref=""
+  for ref in refs/remotes/upstream/HEAD refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master; do
+    if [[ -n $(git -C "$dir" rev-parse --verify --quiet "$ref" 2>/dev/null) ]]; then
+      echo "$ref"
+      return 0
+    fi
+  done
+  return 1
+}
+
+remote_of_ref() {
+  local r="${1#refs/remotes/}"
+  echo "${r%%/*}"
+}
+
+in_rebase() {
+  local dir="$1"
+  [[ -d $dir/.git/rebase-merge || -d $dir/.git/rebase-apply ]]
+}
+
+finish() {
+  # Validate after the tree changed, mirroring omarchy-plugin-update; a bad
+  # upstream state rolls back to where we started, never half-applied.
+  local dir="$1" id="$2" what="$3" up="$4"
+  if ! omarchy-plugin-validate "$dir"; then
+    git -C "$dir" reset --hard ORIG_HEAD >/dev/null
+    echo "omarchy-plugin-graft: $what of '$id' failed validation; rolled back" >&2
+    return 1
+  fi
+  if [[ -n ${up:-} ]]; then
+    # 'git fetch <remote> HEAD' only writes FETCH_HEAD, never the remote
+    # tracking ref; record the tip we just integrated so the diverged
+    # survey stays accurate without a network fetch. A rolled-back graft
+    # never gets here, so the ref keeps pointing at the last integrated
+    # upstream state.
+    git -C "$dir" update-ref "$up" "$(git -C "$dir" rev-parse FETCH_HEAD)"
+  fi
+  GRAFTED_ANY=1
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  echo "$what done for $id."
+  return 0
+}
+
+resume_rebase() {
+  local dir="$1" id="$2" up="$3"
+  local unmerged
+  unmerged=$(git -C "$dir" diff --name-only --diff-filter=U)
+  if [[ -n $unmerged ]]; then
+    echo "$id is paused mid-rebase with unresolved conflicts:"
+    while IFS= read -r f; do echo "  conflict: $f"; done <<<"$unmerged"
+    echo "Resolve, git add them, then run: omarchy-plugin-graft $id"
+    echo "(or run 'git -C $dir rebase --abort' to give up on this graft)"
+    return 1
+  fi
+  if ! git -C "$dir" -c core.editor=/bin/true rebase --continue >/dev/null 2>&1; then
+    echo "omarchy-plugin-graft: could not continue the rebase for '$id'; inspect it with 'git -C $dir status'" >&2
+    return 1
+  fi
+  # Rebase finished: replayed commits are in ORIG_HEAD's shadow.
+  finish "$dir" "$id" "graft" "$up"
+}
+
+graft_one() {
+  local id="$1"
+  local dir="$PLUGINS_DIR/$id"
+
+  [[ -d $dir/.git ]] || fail "plugin '$id' is not a git checkout, so there is nothing to graft"
+
+  local up
+  up=$(upstream_ref "$dir") || fail "cannot resolve an upstream ref for '$id'"
+
+  if in_rebase "$dir"; then
+    resume_rebase "$dir" "$id" "$up"
+    return $?
+  fi
+
+  if [[ -n $(git -C "$dir" status --porcelain) ]]; then
+    echo "omarchy-plugin-graft: '$id' has uncommitted changes; commit or stash them first" >&2
+    return 1
+  fi
+
+  if ! git -C "$dir" fetch --quiet "$(remote_of_ref "$up")" HEAD; then
+    echo "omarchy-plugin-graft: fetch failed for '$id'" >&2
+    return 1
+  fi
+
+  local head_new head_ahead
+  head_new=$(git -C "$dir" rev-list --count HEAD..FETCH_HEAD)
+  head_ahead=$(git -C "$dir" rev-list --count FETCH_HEAD..HEAD)
+
+  if (( head_new == 0 && head_ahead == 0 )); then
+    git -C "$dir" update-ref "$up" "$(git -C "$dir" rev-parse FETCH_HEAD)"
+    echo "$id is up to date."
+    return 0
+  fi
+
+  if (( head_new > 0 )); then
+    echo "Upstream brings $head_new new commit(s) for $id:"
+    git -C "$dir" log --oneline HEAD..FETCH_HEAD | head -20
+    (( $(git -C "$dir" rev-list --count HEAD..FETCH_HEAD) > 20 )) && echo "  ..."
+    if omarchy-cmd-present delta; then
+      git -C "$dir" diff --stat HEAD...FETCH_HEAD | delta --paging=never || true
+    else
+      git -C "$dir" diff --stat HEAD...FETCH_HEAD || true
+    fi
+    echo
+    confirm "Graft upstream into $id?" || {
+      echo "Skipped $id."
+      return 0
+    }
+  fi
+
+  if (( head_ahead == 0 )); then
+    # Pure fast-forward, exactly what omarchy plugin update would do.
+    if ! git -C "$dir" merge --ff-only FETCH_HEAD >/dev/null 2>&1; then
+      echo "omarchy-plugin-graft: unexpected fast-forward failure for '$id'" >&2
+      return 1
+    fi
+    finish "$dir" "$id" "graft" "$up"
+    return $?
+  fi
+
+  # Real graft: replay local commits onto the upstream tip.
+  if ! git -C "$dir" rebase FETCH_HEAD >/dev/null 2>&1; then
+    resume_rebase "$dir" "$id" "$up" # prints conflicts and resume instructions
+    return $?
+  fi
+  finish "$dir" "$id" "graft" "$up"
+}
+
+push_to_fork() {
+  # Only offer when the fork is actually behind the local branch.
+  local dir="$1" branch ahead
+  [[ -n $(git -C "$dir" remote get-url --quiet upstream 2>/dev/null) ]] || return 0
+  branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD)
+  ahead=$(git -C "$dir" rev-list --count "refs/remotes/origin/$branch..HEAD" 2>/dev/null) || ahead=0
+  (( ahead > 0 )) || return 0
+  echo
+  confirm "Push $ahead rebased commit(s) to your fork (origin/$branch)?" || {
+    echo "Not pushed; run 'git push --force-with-lease origin HEAD:$branch' when ready."
+    return 0
+  }
+  if ! git -C "$dir" push --force-with-lease origin "HEAD:$branch"; then
+    echo "omarchy-plugin-graft: push to fork failed; vanilla 'omarchy plugin update' will fail until you push" >&2
+    return 1
+  fi
+}
+
+id=""
+
+while (( $# > 0 )); do
+  case "$1" in
+  --yes | -y)
+    ASSUME_YES=1
+    shift
+    ;;
+  -h | --help)
+    cat <<USAGE
+Usage: omarchy plugin graft <id | --all> [--yes]
+
+Brings upstream changes into a plugin you have locally committed to:
+  - no local commits: reviews upstream diff and fast-forwards (like
+    'omarchy plugin update')
+  - local commits: rebases them onto the upstream tip, one conflict at a
+    time; resolve, git add, and re-run the same command to continue
+  - fork setup (upstream remote): after grafting, offers to push the
+    rebased commits back to your fork so 'omarchy plugin update' keeps
+    working
+Run with no id (or --all) to graft every plugin with local commits.
+Refuses plugins with uncommitted changes: commit or stash first.
+USAGE
+    exit 0
+    ;;
+  -*)
+    fail "unknown graft option: $1"
+    ;;
+  *)
+    [[ -z $id ]] || fail "unexpected argument: $1"
+    id="$1"
+    shift
+    ;;
+  esac
+done
+
+[[ -d $PLUGINS_DIR ]] || fail "no plugins installed at $PLUGINS_DIR"
+
+targets=()
+if [[ -n $id ]]; then
+  if [[ $id == --all ]]; then
+    for dir in "$PLUGINS_DIR"/*/; do
+      [[ -d $dir/.git ]] || continue
+      targets+=("$(basename "$dir")")
+    done
+  else
+    valid_plugin_id "$id" || fail "invalid plugin id '$id'"
+    [[ -d $PLUGINS_DIR/$id ]] || fail "plugin '$id' is not installed"
+    targets=("$id")
+  fi
+else
+  # Interactive chooser over plugins that need attention.
+  choices=()
+  for dir in "$PLUGINS_DIR"/*/; do
+    [[ -d $dir/.git ]] || continue
+    name=$(basename "$dir")
+    if [[ -d $dir/.git/rebase-merge || -d $dir/.git/rebase-apply ]]; then
+      choices+=("$name (mid-rebase)")
+      continue
+    fi
+    # Count local commits against the stable upstream ref, not FETCH_HEAD:
+    # FETCH_HEAD is ephemeral (only written after a fetch inside a graft
+    # run), so a fresh invocation would report 0 local commits for every
+    # plugin and hide the ones with real work to graft.
+    up_ref=$(upstream_ref "$dir") || continue
+    ahead=$(git -C "$dir" rev-list --count "${up_ref}..HEAD" 2>/dev/null || echo 0)
+    (( ahead > 0 )) && choices+=("$name")
+  done
+  if (( ${#choices[@]} == 0 )); then
+    echo "No plugins with local commits to graft. Use 'omarchy plugin update' for clean plugins."
+    exit 0
+  fi
+  interactive || fail "pass a plugin id, or run this interactively"
+  choice=$(printf '%s\n' "${choices[@]}" "ALL of the above" | gum choose --header "Graft which plugin?")
+  if [[ $choice == "ALL of the above" ]]; then
+    for c in "${choices[@]}"; do targets+=("${c% (*}"); done
+  else
+    targets+=("${choice% (*}")
+  fi
+fi
+
+rc=0
+for t in "${targets[@]}"; do
+  graft_one "$t" || rc=1
+  push_to_fork "$PLUGINS_DIR/$t" || rc=1
+done
+
+exit $rc
