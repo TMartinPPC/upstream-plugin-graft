@@ -103,7 +103,17 @@ finish() {
   fi
   GRAFTED_ANY=1
   omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
-  echo "$what done for $id."
+
+  # Summarize what landed: upstream commits integrated (ORIG_HEAD..FETCH_HEAD,
+  # set by both merge and rebase) and local commits that now sit on top.
+  local tip integrated kept
+  tip=$(git -C "$dir" rev-parse --short FETCH_HEAD 2>/dev/null)
+  integrated=$(git -C "$dir" rev-list --count ORIG_HEAD..FETCH_HEAD 2>/dev/null) || integrated=0
+  kept=$(git -C "$dir" rev-list --count "$up..HEAD" 2>/dev/null) || kept=0
+  local msg="$what done for $id: $integrated upstream commit$([ "$integrated" = 1 ] || echo s) integrated"
+  (( kept > 0 )) && msg+="; $kept local commit$([ "$kept" = 1 ] || echo s) kept on top"
+  [[ -n $tip ]] && msg+=" (HEAD is now $tip)"
+  echo "$msg."
   return 0
 }
 
@@ -282,7 +292,12 @@ else
     # plugin and hide the ones with real work to graft.
     up_ref=$(upstream_ref "$dir") || continue
     ahead=$(git -C "$dir" rev-list --count "${up_ref}..HEAD" 2>/dev/null || echo 0)
-    (( ahead > 0 )) && choices+=("$name")
+    if (( ahead > 0 )); then
+      # Carrying local commits puts a plugin in this list permanently —
+      # a successful graft keeps them (replayed) — so say so on the label
+      # instead of implying an upstream graft is always pending.
+      choices+=("$name ($ahead local commit$([ "$ahead" = 1 ] || echo s))")
+    fi
   done
   if (( ${#choices[@]} == 0 )); then
     echo "No plugins with local commits to graft. Use 'omarchy plugin update' for clean plugins."

@@ -193,7 +193,10 @@ clone_plugin p5 test.five
 ahead_commits "$OMARCHY_PLUGINS_DIR/test.five" 2 local
 upstream_commit p5 "upstream adds file" upstream-line
 "$GRAFT" test.five --yes >/dev/null
+gout=$("$GRAFT" test.five --yes 2>&1)
 check_eq "rebase graft exit 0" 0 "$?"
+check_eq "done summary counts upstream + kept" yes \
+  "$(grep -qE 'graft done for test\.five: 1 upstream commit integrated; 2 local commits kept on top' <<<"$gout" && echo yes)"
 check_eq "history order: upstream below local" \
   "local 2
 local 1

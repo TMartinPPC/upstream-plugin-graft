@@ -155,7 +155,7 @@ wizard() {
     origin_url=$(git -C "$dir" remote get-url origin 2>/dev/null) || origin_url=""
 
     if target=$(git -C "$dir" remote get-url upstream 2>/dev/null); then
-      entries+=("$(printf '%s\tinfo\t%s\t✓ upstream set: %s' "$id" "$target" "$target")")
+      entries+=("$(printf '%s\x1finfo\x1f%s\x1f✓ upstream set: %s' "$id" "$target" "$target")")
       continue
     fi
 
@@ -164,14 +164,14 @@ wizard() {
         forked=${info%%$'\t'*}
         target=${info#*$'\t'}
         if [[ $forked == 1 && -n $target ]]; then
-          entries+=("$(printf '%s\tauto\t%s\t⚡ GitHub says %s is a fork of %s — fix it here' \
+          entries+=("$(printf '%s\x1fauto\x1f%s\x1f⚡ GitHub says %s is a fork of %s — fix it here' \
             "$id" "$target" "$repo" "$target")")
           continue
         fi
       fi
     fi
 
-    entries+=("$(printf '%s\tmanual\t\t· no upstream remote — enter the creator URL manually' "$id")")
+    entries+=("$(printf '%s\x1fmanual\x1f\x1f· no upstream remote — enter the creator URL manually' "$id")")
   done
 
   if (( ${#entries[@]} == 0 )); then
@@ -184,7 +184,7 @@ wizard() {
     local -a menu=()
     local i
     for i in "${!entries[@]}"; do
-      IFS=$'\t' read -r id kind target display <<<"${entries[$i]}"
+      IFS=$'\x1f' read -r id kind target display <<<"${entries[$i]}"
       menu+=("$i: $id — $display")
     done
     menu+=("── Done, exit the wizard")
@@ -194,7 +194,7 @@ wizard() {
     [[ $choice == "── Done, exit the wizard" ]] && return 0
     idx=${choice%%:*}
 
-    IFS=$'\t' read -r id kind target display <<<"${entries[$idx]}"
+    IFS=$'\x1f' read -r id kind target display <<<"${entries[$idx]}"
     case "$kind" in
     info)
       echo "Nothing to do for $id."
@@ -202,7 +202,7 @@ wizard() {
     auto)
       if confirm "Add upstream remote 'https://github.com/$target.git' for $id?"; then
         add_upstream "$PLUGINS_DIR/$id" "$id" "https://github.com/$target.git"
-        entries[$idx]="$(printf '%s\tinfo\t%s\t✓ upstream set: https://github.com/%s.git' "$id" "$target" "$target")"
+        entries[$idx]="$(printf '%s\x1finfo\x1f%s\x1f✓ upstream set: https://github.com/%s.git' "$id" "$target" "$target")"
       fi
       ;;
     manual)
@@ -211,7 +211,7 @@ wizard() {
       [[ -n ${url:-} ]] || continue
       if confirm "Add upstream remote '$url' for $id?"; then
         add_upstream "$PLUGINS_DIR/$id" "$id" "$url"
-        entries[$idx]="$(printf '%s\tinfo\t%s\t✓ upstream set: %s' "$id" "$url" "$url")"
+        entries[$idx]="$(printf '%s\x1finfo\x1f%s\x1f✓ upstream set: %s' "$id" "$url" "$url")"
       fi
       ;;
     esac
