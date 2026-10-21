@@ -23,7 +23,7 @@ check_eq() { # description expected actual
   if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (expected [$2], got [$3])"; fi
 }
 
-cleanup() { rm -rf "$WORK"; }
+cleanup() { [[ ${KEEP_WORK:-} ]] || rm -rf "$WORK"; }
 trap cleanup EXIT
 
 # ---- stubs ---------------------------------------------------------------
@@ -33,6 +33,7 @@ cat >"$WORK/stubs/gum" <<'STUB'
 case "$1" in
 choose)
   mapfile -t lines
+  [[ -n ${FAKE_GUM_MENU:-} ]] && printf '%s\n' "${lines[@]}" >"$FAKE_GUM_MENU"
   if [[ -n ${FAKE_GUM_QUEUE:-} && -s $FAKE_GUM_QUEUE ]]; then
     tok=$(head -n1 "$FAKE_GUM_QUEUE")
     sed -i '1d' "$FAKE_GUM_QUEUE"
@@ -136,19 +137,20 @@ make_plugin_origin p1 test.one
 clone_plugin p1 test.one
 ahead_commits "$OMARCHY_PLUGINS_DIR/test.one" 2 local
 
+# New semantics: a clean carrier of local commits (nothing waiting from
+# upstream) is NOT attention, so it is not reported.
 out=$("$DIVERGED" --json test.one)
-check_eq "diverged exit 0 when diverged" 0 "$?"
-check_eq "json ahead count" 2 "$(jq -r '.[0].ahead' <<<"$out")"
-check_eq "json dirty flag" false "$(jq -r '.[0].dirty' <<<"$out")"
-check_eq "json rebase flag" false "$(jq -r '.[0].rebaseInProgress' <<<"$out")"
-check_eq "json upstream ref" refs/remotes/origin/HEAD "$(jq -r '.[0].upstream' <<<"$out")"
-
+check_eq "synced carrier not reported" "[]" "$out"
 "$DIVERGED" test.one >/dev/null
-check_eq "text exit 0 when diverged" 0 "$?"
+check_eq "synced carrier exit 1" 1 "$?"
 
 touch "$OMARCHY_PLUGINS_DIR/test.one/stray"
 out=$("$DIVERGED" --json test.one)
 check_eq "dirty flag on untracked file" true "$(jq -r '.[0].dirty' <<<"$out")"
+check_eq "json ahead count" 2 "$(jq -r '.[0].ahead' <<<"$out")"
+check_eq "json upstream ref" refs/remotes/origin/HEAD "$(jq -r '.[0].upstream' <<<"$out")"
+"$DIVERGED" test.one >/dev/null
+check_eq "text exit 0 when diverged" 0 "$?"
 rm "$OMARCHY_PLUGINS_DIR/test.one/stray"
 
 make_plugin_origin p2 test.two
@@ -174,6 +176,21 @@ rm "$OMARCHY_PLUGINS_DIR/test.three/stray"
 
 "$DIVERGED" nope.plugin >/dev/null 2>&1
 check_eq "unknown plugin id exit 2" 2 "$?"
+
+echo "== diverged: --fetch mode =="
+# --fetch is the bar-widget view: refreshes tips, then reports only
+# actionable plugins. A carrier stays invisible until upstream moves.
+make_plugin_origin pd test.fourteen
+clone_plugin pd test.fourteen
+ahead_commits "$OMARCHY_PLUGINS_DIR/test.fourteen" 2 local
+out=$("$DIVERGED" --fetch --json test.fourteen)
+check_eq "fetched carrier with nothing waiting not reported" "[]" "$out"
+upstream_commit pd "upstream moves" moved-line
+out=$("$DIVERGED" --fetch --json test.fourteen)
+check_eq "fetched incoming flagged" 1 "$(jq -r '.[0].incoming' <<<"$out")"
+check_eq "fetched ahead is local count" 2 "$(jq -r '.[0].ahead' <<<"$out")"
+"$DIVERGED" --fetch test.fourteen >/dev/null
+check_eq "fetched attention exit 0" 0 "$?"
 
 # ---- graft -----------------------------------------------------------------
 
@@ -205,14 +222,17 @@ upstream adds file" \
 check_eq "local file content kept" "local-1
 local-2" "$(tail -n2 "$OMARCHY_PLUGINS_DIR/test.five/sub/extra.txt")"
 check_eq "upstream file content merged" "upstream-line" "$(cat "$OMARCHY_PLUGINS_DIR/test.five/sub/Service.qml")"
-# After a graft the local commits remain (by design), so the survey keeps
-# flagging the plugin: what must clear is the rebase/dirty state and the
-# stale upstream tip.
+# New semantics: after a successful graft the plugin is a synced carrier —
+# not reported until upstream actually moves again.
 out=$("$DIVERGED" --json test.five)
-check_eq "post-rebase survey exit 0 (local commits remain)" 0 "$?"
-check_eq "post-rebase ahead is local count" 2 "$(jq -r '.[0].ahead' <<<"$out")"
-check_eq "post-rebase rebase cleared" false "$(jq -r '.[0].rebaseInProgress' <<<"$out")"
-check_eq "post-rebase clean tree" false "$(jq -r '.[0].dirty' <<<"$out")"
+check_eq "synced carrier no longer reported" "[]" "$out"
+"$DIVERGED" test.five >/dev/null
+check_eq "synced carrier exit 1" 1 "$?"
+
+upstream_commit p5 "upstream adds polish" polish-line
+out=$("$DIVERGED" --fetch --json test.five)
+check_eq "new upstream commit flagged" 1 "$(jq -r '.[0].incoming' <<<"$out")"
+check_eq "local count preserved" 2 "$(jq -r '.[0].ahead' <<<"$out")"
 
 echo "== graft: conflict pause and resume =="
 make_plugin_origin p6 test.six
@@ -231,8 +251,9 @@ git -C "$OMARCHY_PLUGINS_DIR/test.six" add sub/Service.qml
 "$GRAFT" test.six --yes >/dev/null
 check_eq "resume exits 0" 0 "$?"
 check_eq "conflict resolution kept" "both" "$(cat "$OMARCHY_PLUGINS_DIR/test.six/sub/Service.qml")"
+check_eq "post-resume rebase cleared" false "$(git -C "$OMARCHY_PLUGINS_DIR/test.six" test -d .git/rebase-merge && echo true || echo false)"
 out=$("$DIVERGED" --json test.six)
-check_eq "post-resume rebase cleared" false "$(jq -r '.[0].rebaseInProgress' <<<"$out")"
+check_eq "post-resume survey empty" "[]" "$out"
 
 echo "== graft: dirty tree refusal =="
 make_plugin_origin p7 test.seven
@@ -302,33 +323,51 @@ check_eq "graft --all exit 0" 0 "$?"
 check_eq "plugin 9 grafted" "local 1" "$(git -C "$W3/test.nine" log -1 --format=%s)"
 check_eq "plugin 10 grafted" "local 1" "$(git -C "$W3/test.ten" log -1 --format=%s)"
 check_eq "plugin 9 has upstream too" "upstream 9" "$(git -C "$W3/test.nine" log --format=%s -2 | tail -1)"
-export OMARCHY_PLUGINS_DIR="$WORK/plugins"
 
 echo "== graft: interactive chooser (pseudo-tty) =="
-# The chooser is the path the bar widget hits; regression test for the
-# FETCH_HEAD bug that made it see zero diverged plugins. "*" picks the
-# last menu entry ("ALL of the above").
+# The chooser is the path the bar widget hits. Carriers with nothing
+# incoming must NOT be listed: give test.nine real incoming upstream work,
+# then "*" picks the last menu entry ("ALL of the above").
+upstream_commit p9 "upstream chooser tick" chooser-line
+# Chooser runs against the isolated W3 zoo so candidate sets are known.
+export OMARCHY_PLUGINS_DIR="$W3"
 if command -v script >/dev/null 2>&1; then
   export FAKE_GUM_QUEUE="$WORK/chooser-queue"
-  echo "*" >"$FAKE_GUM_QUEUE"
+  export FAKE_GUM_MENU="$WORK/chooser-menu"
+  # Select the test.nine entry (index 0) so its label shows in the output.
+  echo "0" >"$FAKE_GUM_QUEUE"
   script -qec "$GRAFT" "$WORK/chooser-typescript" </dev/null >/dev/null
   tty_out="$(cat "$WORK/chooser-typescript")"
-  check_eq "chooser saw diverged plugins (no empty-report message)" \
-    yes "$(grep -q 'No plugins with local commits' <<<"$tty_out" && echo no || echo yes)"
-  check_eq "chooser ran the grafts" yes "$(grep -qE 'up to date|graft done' <<<"$tty_out" && echo yes)"
-  unset FAKE_GUM_QUEUE
+  menu_out="$(cat "$WORK/chooser-menu")"
+  check_eq "chooser listed the plugin with incoming commits" \
+    yes "$(grep -q 'test.nine (1 upstream commit waiting; 1 local)' <<<"$menu_out" && echo yes)"
+  check_eq "chooser skipped synced carriers" \
+    yes "$(grep -q 'test.ten' <<<"$menu_out" && echo no || echo yes)"
+  check_eq "chooser offered the fork wizard" yes \
+    "$(grep -q 'Set up fork upstreams' <<<"$menu_out" && echo yes)"
+  check_eq "chooser ran the graft" yes "$(grep -q 'graft done for test.nine' <<<"$tty_out" && echo yes)"
+  check_eq "chooser integrated the incoming commit" "upstream chooser tick" \
+    "$(git -C "$W3/test.nine" log --format=%s -3 | grep 'upstream chooser tick')"
+  unset FAKE_GUM_QUEUE FAKE_GUM_MENU
 else
   echo "  skip - script(1) unavailable"
 fi
+
+echo "== graft: chooser empty state =="
+out=$("$GRAFT" 2>&1)
+check_eq "empty state exits 0" 0 "$?"
+check_eq "empty state reports nothing waiting" yes "$(grep -q 'No upstream changes waiting' <<<"$out" && echo yes)"
+check_eq "empty state suggests the fork wizard" yes "$(grep -q 'omarchy-plugin-fork' <<<"$out" && echo yes)"
 
 # ---- fork ------------------------------------------------------------------
 
 echo "== fork: refusals =="
 "$FORK" nope.plugin >/dev/null 2>&1
 check_eq "unknown plugin refused" 1 "$?"
-git -C "$OMARCHY_PLUGINS_DIR/test.nine" remote add upstream "$WORK/p9.git"
+git -C "$W3/test.nine" remote add upstream "$WORK/p9.git"
 "$FORK" test.nine >/dev/null 2>&1
 check_eq "already-forked plugin refused" 1 "$?"
+export OMARCHY_PLUGINS_DIR="$WORK/plugins"
 
 echo "== fork: URL parser =="
 eval "$(sed -n '/^github_repo_of_url()/,/^}/p' "$FORK")"
@@ -363,7 +402,8 @@ git -C "$W1/test.eleven" remote set-url upstream "$WORK/pb.git"
 git -C "$W1/test.eleven" fetch -q upstream
 git -C "$W1/test.eleven" remote set-head upstream -a
 ahead_commits "$W1/test.eleven" 1 local
-out=$("$DIVERGED" --json test.eleven)
+upstream_commit pb "upstream badge" badge-line
+out=$("$DIVERGED" --fetch --json test.eleven)
 check_eq "upstream now resolves for graft" refs/remotes/upstream/HEAD "$(jq -r '.[0].upstream' <<<"$out")"
 export OMARCHY_PLUGINS_DIR="$WORK/plugins"
 

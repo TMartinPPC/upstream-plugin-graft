@@ -19,10 +19,15 @@ after graft: A---B---E---F (upstream 1.4)
 ## What's here
 
 - `bin/` — the CLI, installed into `~/.local/bin`:
-  - `omarchy-plugin-diverged [--json] [id...]` — purely local survey of
-    installed git-cloned plugins: which have local commits, uncommitted
-    changes, or a paused graft rebase. Exit 0 when at least one needs
-    attention, 1 when none do (like `omarchy-update-available`). No network.
+  - `omarchy-plugin-diverged [--fetch] [--json] [id...]` — survey of
+    installed git-cloned plugins that need attention: upstream commits
+    waiting to be grafted, uncommitted changes, or a paused graft rebase.
+    Plugins that merely carry local commits (already grafted, nothing
+    waiting) are not reported. Exit 0 when at least one needs attention,
+    1 when none do (like `omarchy-update-available`). Without `--fetch` it
+    is purely local and sees upstream tips only as of the last graft;
+    `--fetch` refreshes each candidate's tip first (what the bar widget
+    uses, so "nothing waiting" is trustworthy).
   - `omarchy-plugin-graft <id | --all> [--yes]` — fetch the creator's
     default-branch tip, review what's incoming, then:
     - no local commits? behaves exactly like `omarchy plugin update`
@@ -31,13 +36,17 @@ after graft: A---B---E---F (upstream 1.4)
       the rebase — resolve, `git add`, and re-run the same command to continue
     - fork setups (`upstream` remote, see below): offers to force-with-lease
       push replayed commits back to your fork after grafting
+    - run with no id for an interactive picker that fetches the plugins
+      carrying local commits and lists only the ones with incoming work
+      (plus a shortcut into the fork setup wizard)
   - `omarchy-plugin-fork <id> [--yes]` — escape hatch: `gh repo fork` the
     origin, rename `origin` → `upstream`, point `origin` at your fork, push
     your local commits. Then vanilla `omarchy plugin update` works again
     (against your fork) and graft keeps tracking the creator.
 - `plugin/` — the Omarchy bar widget (`io.github.tmartinppc.plugin-graft`):
-  a badge showing the diverged count, hidden when everything is in sync.
-  Click opens `omarchy-plugin-graft` in a held-open terminal.
+  a badge showing how many plugins need upstream sync, hidden when
+  everything is in sync. Click opens `omarchy-plugin-graft` in a held-open
+  terminal.
 
 ## First launch: tell graft which plugins are forks
 

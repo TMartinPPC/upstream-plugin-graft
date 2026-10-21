@@ -277,8 +277,15 @@ if [[ -n $id ]]; then
     targets=("$id")
   fi
 else
-  # Interactive chooser over plugins that need attention.
+  # Interactive chooser: plugins with something actionable. Paused rebases
+  # are always listed; carrying-local-commit plugins are listed only when a
+  # fetch shows the creator actually has new commits. Knowing "nothing
+  # incoming" requires the network, so carriers are fetched here — the
+  # badge stays no-network and counts carriers, the click window stays
+  # honest about action.
   choices=()
+  carrier_names=()
+  carrier_aheads=()
   for dir in "$PLUGINS_DIR"/*/; do
     [[ -d $dir/.git ]] || continue
     name=$(basename "$dir")
@@ -292,20 +299,47 @@ else
     # plugin and hide the ones with real work to graft.
     up_ref=$(upstream_ref "$dir") || continue
     ahead=$(git -C "$dir" rev-list --count "${up_ref}..HEAD" 2>/dev/null || echo 0)
-    if (( ahead > 0 )); then
-      # Carrying local commits puts a plugin in this list permanently —
-      # a successful graft keeps them (replayed) — so say so on the label
-      # instead of implying an upstream graft is always pending.
-      choices+=("$name ($ahead local commit$([ "$ahead" = 1 ] || echo s))")
-    fi
+    (( ahead > 0 )) && carrier_names+=("$name") && carrier_aheads+=("$ahead")
   done
+
+  if (( ${#carrier_names[@]} > 0 )); then
+    echo "Checking ${#carrier_names[@]} plugin$([ ${#carrier_names[@]} = 1 ] || echo s) for upstream changes..."
+    for i in "${!carrier_names[@]}"; do
+      name=${carrier_names[$i]}
+      ahead=${carrier_aheads[$i]}
+      dir="$PLUGINS_DIR/$name"
+      remote=$(remote_of_ref "$(upstream_ref "$dir")")
+      if ! git -C "$dir" fetch --quiet "$remote" HEAD; then
+        choices+=("$name ($ahead local commit$([ "$ahead" = 1 ] || echo s); upstream unreachable)")
+        continue
+      fi
+      incoming=$(git -C "$dir" rev-list --count HEAD..FETCH_HEAD 2>/dev/null || echo 0)
+      if (( incoming > 0 )); then
+        choices+=("$name ($incoming upstream commit$([ "$incoming" = 1 ] || echo s) waiting; $ahead local)")
+      fi
+      # Nothing incoming: not listed. The local commits are already safe
+      # (grafted, and pushed when a fork remote exists), so surfacing the
+      # plugin here would only imply an action that doesn't exist.
+    done
+  fi
+
   if (( ${#choices[@]} == 0 )); then
-    echo "No plugins with local commits to graft. Use 'omarchy plugin update' for clean plugins."
+    echo "No upstream changes waiting."
+    missing=0
+    for dir in "$PLUGINS_DIR"/*/; do
+      [[ -d $dir/.git ]] || continue
+      git -C "$dir" remote get-url upstream >/dev/null 2>&1 || missing=$((missing + 1))
+    done
+    if (( missing > 0 )); then
+      echo "$missing installed plugin$([ "$missing" = 1 ] || echo s) without an upstream remote — run 'omarchy-plugin-fork' to wire them up."
+    fi
     exit 0
   fi
   interactive || fail "pass a plugin id, or run this interactively"
-  choice=$(printf '%s\n' "${choices[@]}" "ALL of the above" | gum choose --header "Graft which plugin?")
-  if [[ $choice == "ALL of the above" ]]; then
+  choice=$(printf '%s\n' "${choices[@]}" "── Set up fork upstreams…" "ALL of the above" | gum choose --header "Graft which plugin?")
+  if [[ $choice == "── Set up fork upstreams…" ]]; then
+    exec omarchy-plugin-fork
+  elif [[ $choice == "ALL of the above" ]]; then
     for c in "${choices[@]}"; do targets+=("${c% (*}"); done
   else
     targets+=("${choice% (*}")

@@ -32,7 +32,10 @@ BarWidget {
 
   Process {
     id: scanProc
-    command: ["omarchy-plugin-diverged", "--json"]
+    // --fetch makes "nothing waiting" trustworthy: it refreshes each
+    // candidate's upstream tip (same bookkeeping graft uses). A failed
+    // fetch (offline) keeps the last known tip instead of erroring.
+    command: ["omarchy-plugin-diverged", "--fetch", "--json"]
     stdout: StdioCollector {
       id: scanOut
       waitForEnd: true
@@ -60,8 +63,8 @@ BarWidget {
     slotSize: Style.bar.statusSlot
     fontSize: Style.font.caption
     tooltipText: root.diverged === 1
-      ? "1 plugin has local commits — click to graft upstream"
-      : root.diverged + " plugins have local commits — click to graft upstream"
+      ? "1 plugin needs upstream sync — click to graft"
+      : root.diverged + " plugins need upstream sync — click to graft"
     onPressed: root.runGraft()
   }
 }

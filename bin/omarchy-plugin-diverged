@@ -16,6 +16,7 @@ set -euo pipefail
 
 PLUGINS_DIR="${OMARCHY_PLUGINS_DIR:-$HOME/.config/omarchy/plugins}"
 AS_JSON=0
+DO_FETCH=0
 
 fail() {
   echo "omarchy-plugin-diverged: $*" >&2
@@ -52,9 +53,26 @@ upstream_ref() {
   return 1
 }
 
-# Prints: id \t upstream-ref-or-unknown \t ahead \t dirty \t rebasing
+# Fetch mode: refresh every candidate's upstream tip before surveying, using
+# the same bookkeeping as graft's finish (update-ref on success only, so a
+# failed fetch keeps the last integrated tip). Without this the survey is
+# purely local and can only see what the last graft/fetch recorded.
+fetch_tips() {
+  local dir up remote
+  for id in "${ids[@]}"; do
+    dir="$PLUGINS_DIR/$id"
+    [[ -d $dir/.git ]] || continue
+    up=$(upstream_ref "$dir") || continue
+    remote=${up#refs/remotes/}
+    remote=${remote%%/*}
+    git -C "$dir" fetch --quiet "$remote" HEAD 2>/dev/null &&
+      git -C "$dir" update-ref "$up" "$(git -C "$dir" rev-parse FETCH_HEAD 2>/dev/null)" 2>/dev/null || true
+  done
+}
+
+# Prints: id \t upstream-ref-or-unknown \t ahead(local) \t incoming \t dirty \t rebasing
 survey_one() {
-  local dir="$PLUGINS_DIR/$1" up="" ahead=0 dirty=0 rebasing=0
+  local dir="$PLUGINS_DIR/$1" up="" ahead=0 incoming=0 dirty=0 rebasing=0
 
   git -C "$dir" diff --quiet 2>/dev/null && git -C "$dir" diff --cached --quiet 2>/dev/null \
     && [[ -z $(git -C "$dir" status --porcelain 2>/dev/null) ]] || dirty=1
@@ -64,32 +82,35 @@ survey_one() {
   if up=$(upstream_ref "$dir"); then
     if [[ -z $(git -C "$dir" rev-parse --verify --quiet "$up" 2>/dev/null) ]]; then
       # Declared upstream whose tracking refs were never fetched.
-      printf '%s\tunknown\t0\t%d\t%d\n' "$1" "$dirty" "$rebasing"
+      printf '%s\tunknown\t0\t0\t%d\t%d\n' "$1" "$dirty" "$rebasing"
       return 0
     fi
     ahead=$(git -C "$dir" rev-list --count "$up..HEAD" 2>/dev/null) || ahead=0
-    printf '%s\t%s\t%d\t%d\t%d\n' "$1" "$up" "$ahead" "$dirty" "$rebasing"
+    incoming=$(git -C "$dir" rev-list --count "HEAD..$up" 2>/dev/null) || incoming=0
+    printf '%s\t%s\t%d\t%d\t%d\t%d\n' "$1" "$up" "$ahead" "$incoming" "$dirty" "$rebasing"
   else
-    printf '%s\tunknown\t0\t%d\t%d\n' "$1" "$dirty" "$rebasing"
+    printf '%s\tunknown\t0\t0\t%d\t%d\n' "$1" "$dirty" "$rebasing"
   fi
 }
 
 text_record() {
-  local id="$1" up="$2" ahead="$3" dirty="$4" rebasing="$5"
+  local id="$1" up="$2" ahead="$3" incoming="$4" dirty="$5" rebasing="$6"
   local parts=()
   if [[ $up == unknown ]]; then
     parts=("cannot resolve an upstream ref")
   fi
   (( rebasing )) && parts+=("graft paused mid-rebase")
   (( dirty )) && parts+=("uncommitted changes")
+  (( incoming > 0 )) && parts+=("$incoming upstream commit$([ "$incoming" = 1 ] || echo s) waiting")
   (( ahead > 0 )) && parts+=("$ahead local commit$([ "$ahead" = 1 ] || echo s) on top of ${up#refs/remotes/}")
-  echo "$id: ${parts[0]}${parts[1]:+; ${parts[1]}}${parts[2]:+; ${parts[2]}}"
+  echo "$id: ${parts[0]}${parts[1]:+; ${parts[1]}}${parts[2]:+; ${parts[2]}}${parts[3]:+; ${parts[3]}}"
 }
 
 json_record() {
-  jq -cn --arg id "$1" --arg upstream "$2" --arg ahead "$3" \
-    --arg dirty "$4" --arg rebasing "$5" '
+  jq -cn --arg id "$1" --arg upstream "$2" --arg ahead "$3" --arg incoming "$4" \
+    --arg dirty "$5" --arg rebasing "$6" '
     { id: $id, upstream: $upstream, ahead: ($ahead | tonumber),
+      incoming: ($incoming | tonumber),
       dirty: ($dirty == "1"), rebaseInProgress: ($rebasing == "1") }'
 }
 
@@ -100,14 +121,24 @@ while (( $# > 0 )); do
     AS_JSON=1
     shift
     ;;
+  --fetch | -f)
+    DO_FETCH=1
+    shift
+    ;;
   -h | --help)
     cat <<USAGE
-Usage: omarchy plugin diverged [--json] [id...]
+Usage: omarchy plugin diverged [--fetch] [--json] [id...]
 
-Surveys installed git-managed plugins for local commits, uncommitted
-changes, or a paused graft rebase. Purely local: no network. --json emits
-only the plugins that need attention. Exits 0 when at least one plugin
-needs attention, 1 when none do.
+Surveys installed git-managed plugins for upstream commits waiting to be
+grafted, uncommitted changes, or a paused graft rebase. Plugins that merely
+carry local commits (already grafted, nothing waiting) are NOT reported.
+
+Purely local by default: no network, so it only sees upstream tips as of
+the last graft or fetch. --fetch refreshes each candidate's upstream tip
+first (same bookkeeping graft uses), which makes "nothing waiting"
+trustworthy; use it for bar-widget scans. --json emits only the plugins
+that need attention. Exits 0 when at least one plugin needs attention,
+1 when none do.
 USAGE
     exit 0
     ;;
@@ -136,14 +167,20 @@ fi
 [[ ${#ids[@]} -gt 0 ]] || (echo "No git-managed plugins installed."; exit 1)
 
 needs=0
+(( DO_FETCH )) && fetch_tips
+
+attention() { # up ahead incoming dirty rebasing
+  (( $3 > 0 || $4 || $5 )) || [[ $1 == unknown ]]
+}
+
 if (( AS_JSON )); then
   # Collect in the main shell: a for|jq pipeline would run the loop in a
   # subshell and lose the needs counter (and thus the exit code).
   records=()
   for id in "${ids[@]}"; do
-    IFS=$'\t' read -r id up ahead dirty rebasing <<<"$(survey_one "$id")"
-    if (( dirty || rebasing || ahead > 0 )) || [[ $up == unknown ]]; then
-      records+=("$(json_record "$id" "$up" "$ahead" "$dirty" "$rebasing")")
+    IFS=$'\t' read -r id up ahead incoming dirty rebasing <<<"$(survey_one "$id")"
+    if attention "$up" "$ahead" "$incoming" "$dirty" "$rebasing"; then
+      records+=("$(json_record "$id" "$up" "$ahead" "$incoming" "$dirty" "$rebasing")")
       needs=$((needs + 1))
     fi
   done
@@ -154,9 +191,9 @@ if (( AS_JSON )); then
   fi
 else
   for id in "${ids[@]}"; do
-    IFS=$'\t' read -r id up ahead dirty rebasing <<<"$(survey_one "$id")"
-    if (( dirty || rebasing || ahead > 0 )) || [[ $up == unknown ]]; then
-      text_record "$id" "$up" "$ahead" "$dirty" "$rebasing"
+    IFS=$'\t' read -r id up ahead incoming dirty rebasing <<<"$(survey_one "$id")"
+    if attention "$up" "$ahead" "$incoming" "$dirty" "$rebasing"; then
+      text_record "$id" "$up" "$ahead" "$incoming" "$dirty" "$rebasing"
       needs=$((needs + 1))
     fi
   done
