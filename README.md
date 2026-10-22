@@ -38,7 +38,9 @@ after graft: A---B---E---F (upstream 1.4)
       push replayed commits back to your fork after grafting
     - run with no id for an interactive picker that fetches the plugins
       carrying local commits and lists only the ones with incoming work
-      (plus a shortcut into the fork setup wizard)
+      (plus a shortcut into the fork setup wizard); plain plugins (origin
+      is the creator, no fork, no local commits) are handed to the native
+      `omarchy plugin update` instead of being grafted
   - `omarchy-plugin-fork <id> [--yes]` — escape hatch: `gh repo fork` the
     origin, rename `origin` → `upstream`, point `origin` at your fork, push
     your local commits. Then vanilla `omarchy plugin update` works again

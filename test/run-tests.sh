@@ -363,13 +363,13 @@ echo "== graft: interactive chooser (pseudo-tty) =="
 # then "*" picks the last menu entry ("ALL of the above").
 upstream_commit p9 "upstream chooser tick" chooser-line
 upstream_commit pa "upstream plain tick" plain-line
-upstream_commit pf "upstream plain tick" plain-line
 # A clean plain plugin for the update-routing path: origin = creator, no
 # fork, no local commits — exactly what the native updater should handle.
 make_plugin_origin pf test.sixteen
 git clone -q "$WORK/pf.git" "$W3/test.sixteen"
 git -C "$W3/test.sixteen" config user.email t@t
 git -C "$W3/test.sixteen" config user.name T
+upstream_commit pf "upstream plain tick" plain-line
 # Chooser runs against the isolated W3 zoo so candidate sets are known.
 # test.nine and test.ten carry local commits (graft); test.sixteen is a
 # clean plain plugin (routed to the native updater).
