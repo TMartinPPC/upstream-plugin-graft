@@ -265,91 +265,181 @@ done
 [[ -d $PLUGINS_DIR ]] || fail "no plugins installed at $PLUGINS_DIR"
 
 targets=()
-if [[ -n $id ]]; then
-  if [[ $id == --all ]]; then
-    for dir in "$PLUGINS_DIR"/*/; do
-      [[ -d $dir/.git ]] || continue
-      targets+=("$(basename "$dir")")
+  # Best existing remote-tracking ref for counting local commits: prefer
+  # fetched upstream tracking refs, fall back to origin. Used for labels —
+  # the authoritative check is always the fetch itself.
+  count_ref() {
+    local dir="$1" r
+    for r in refs/remotes/upstream/HEAD refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master; do
+      [[ -n $(git -C "$dir" rev-parse --verify --quiet "$r" 2>/dev/null) ]] && {
+        echo "$r"
+        return 0
+      }
     done
-  else
-    valid_plugin_id "$id" || fail "invalid plugin id '$id'"
-    [[ -d $PLUGINS_DIR/$id ]] || fail "plugin '$id' is not installed"
-    targets=("$id")
-  fi
-else
-  # Interactive chooser: plugins with something actionable. Paused rebases
-  # are always listed; carrying-local-commit plugins are listed only when a
-  # fetch shows the creator actually has new commits. Knowing "nothing
-  # incoming" requires the network, so carriers are fetched here — the
-  # badge stays no-network and counts carriers, the click window stays
-  # honest about action.
-  choices=()
-  carrier_names=()
-  carrier_aheads=()
-  for dir in "$PLUGINS_DIR"/*/; do
-    [[ -d $dir/.git ]] || continue
-    name=$(basename "$dir")
+    return 1
+  }
+
+  # Classify one plugin: graft (has an upstream remote, or local commits —
+  # the native updater would refuse those) or update (plain plugin: origin
+  # is the creator, no fork, no local commits).
+  # Sets NAME_KIND ("graft"|"update") and NAME_AHEAD.
+  classify() {
+    local dir="$PLUGINS_DIR/$1" rref
     if [[ -d $dir/.git/rebase-merge || -d $dir/.git/rebase-apply ]]; then
-      choices+=("$name (mid-rebase)")
-      continue
+      NAME_KIND=graft
+      NAME_AHEAD=0
+      return 0
     fi
-    # Count local commits against the stable upstream ref, not FETCH_HEAD:
-    # FETCH_HEAD is ephemeral (only written after a fetch inside a graft
-    # run), so a fresh invocation would report 0 local commits for every
-    # plugin and hide the ones with real work to graft.
-    up_ref=$(upstream_ref "$dir") || continue
-    ahead=$(git -C "$dir" rev-list --count "${up_ref}..HEAD" 2>/dev/null || echo 0)
-    (( ahead > 0 )) && carrier_names+=("$name") && carrier_aheads+=("$ahead")
-  done
-
-  if (( ${#carrier_names[@]} > 0 )); then
-    echo "Checking ${#carrier_names[@]} plugin$([ ${#carrier_names[@]} = 1 ] || echo s) for upstream changes..."
-    for i in "${!carrier_names[@]}"; do
-      name=${carrier_names[$i]}
-      ahead=${carrier_aheads[$i]}
-      dir="$PLUGINS_DIR/$name"
-      remote=$(remote_of_ref "$(upstream_ref "$dir")")
-      if ! git -C "$dir" fetch --quiet "$remote" HEAD; then
-        choices+=("$name ($ahead local commit$([ "$ahead" = 1 ] || echo s); upstream unreachable)")
-        continue
+    if git -C "$dir" remote get-url upstream >/dev/null 2>&1; then
+      # Fork declaration exists: always a graft candidate, even when its
+      # tracking refs were never fetched (wizard-added, fetch failed) —
+      # the fetch in the chooser reveals what's actually waiting.
+      NAME_KIND=graft
+      if rref=$(count_ref "$dir"); then
+        NAME_AHEAD=$(git -C "$dir" rev-list --count "${rref}..HEAD" 2>/dev/null || echo 0)
+      else
+        NAME_AHEAD=0
       fi
-      incoming=$(git -C "$dir" rev-list --count HEAD..FETCH_HEAD 2>/dev/null || echo 0)
-      if (( incoming > 0 )); then
-        choices+=("$name ($incoming upstream commit$([ "$incoming" = 1 ] || echo s) waiting; $ahead local)")
-      fi
-      # Nothing incoming: not listed. The local commits are already safe
-      # (grafted, and pushed when a fork remote exists), so surfacing the
-      # plugin here would only imply an action that doesn't exist.
-    done
-  fi
+      return 0
+    fi
+    rref=$(count_ref "$dir") || {
+      NAME_KIND=none
+      return 1
+    }
+    NAME_AHEAD=$(git -C "$dir" rev-list --count "${rref}..HEAD" 2>/dev/null || echo 0)
+    if (( NAME_AHEAD > 0 )); then
+      NAME_KIND=graft
+    else
+      NAME_KIND=update
+    fi
+    return 0
+  }
 
-  if (( ${#choices[@]} == 0 )); then
-    echo "No upstream changes waiting."
-    missing=0
+  if [[ -n $id ]]; then
+    if [[ $id == --all ]]; then
+      for dir in "$PLUGINS_DIR"/*/; do
+        [[ -d $dir/.git ]] || continue
+        name=$(basename "$dir")
+        if classify "$name"; then
+          targets+=("$name")
+          target_actions+=("$NAME_KIND")
+        fi
+      done
+    else
+      valid_plugin_id "$id" || fail "invalid plugin id '$id'"
+      [[ -d $PLUGINS_DIR/$id ]] || fail "plugin '$id' is not installed"
+      [[ -d $PLUGINS_DIR/$id/.git ]] || fail "plugin '$id' is not a git checkout, so there is nothing to graft"
+      if classify "$id"; then
+        targets=("$id")
+        target_actions=("$NAME_KIND")
+      else
+        fail "cannot resolve an upstream ref for '$id'"
+      fi
+    fi
+  else
+    # Interactive chooser: plugins with something actionable. Paused rebases
+    # are always listed; plugins are listed only when a fetch shows new
+    # upstream commits. Carriers (fork plugins with local commits) graft;
+    # plain plugins route to 'omarchy plugin update'. Knowing "nothing
+    # incoming" requires the network, so candidates are fetched here — the
+    # badge stays no-network and counts carriers, the click window stays
+    # honest about action.
+    choices=()
+    actions=() # parallel to choices: graft | update
+    names=()
+    aheads=()
     for dir in "$PLUGINS_DIR"/*/; do
       [[ -d $dir/.git ]] || continue
-      git -C "$dir" remote get-url upstream >/dev/null 2>&1 || missing=$((missing + 1))
+      name=$(basename "$dir")
+      classify "$name" || continue
+      if [[ $NAME_KIND == graft ]]; then
+        # Carriers and paused rebases are always candidates; the fetch in
+        # the names loop decides whether anything is actually waiting.
+        names+=("$name")
+        aheads+=("$NAME_AHEAD")
+      else
+        # Plain plugin: fetch origin (the creator repo) to see if anything
+        # is waiting, and hand it to the native updater when it is.
+        if git -C "$dir" fetch --quiet origin HEAD; then
+          incoming=$(git -C "$dir" rev-list --count HEAD..FETCH_HEAD 2>/dev/null || echo 0)
+          if (( incoming > 0 )); then
+            choices+=("$name ($incoming upstream commit$([ "$incoming" = 1 ] || echo s) waiting; plain update — no local commits)")
+            actions+=(update)
+          fi
+        fi
+      fi
     done
-    if (( missing > 0 )); then
-      echo "$missing installed plugin$([ "$missing" = 1 ] || echo s) without an upstream remote — run 'omarchy-plugin-fork' to wire them up."
+
+    if (( ${#names[@]} > 0 )); then
+      echo "Checking ${#names[@]} plugin$([ ${#names[@]} = 1 ] || echo s) with local commits for upstream changes..."
+      for i in "${!names[@]}"; do
+        name=${names[$i]}
+        ahead=${aheads[$i]}
+        dir="$PLUGINS_DIR/$name"
+        remote=$(remote_of_ref "$(upstream_ref "$dir")")
+        if ! git -C "$dir" fetch --quiet "$remote" HEAD; then
+          choices+=("$name ($ahead local commit$([ "$ahead" = 1 ] || echo s); upstream unreachable)")
+          actions+=(graft)
+          continue
+        fi
+        incoming=$(git -C "$dir" rev-list --count HEAD..FETCH_HEAD 2>/dev/null || echo 0)
+        if (( incoming > 0 )); then
+          choices+=("$name ($incoming upstream commit$([ "$incoming" = 1 ] || echo s) waiting; $ahead local)")
+          actions+=(graft)
+        fi
+        # Nothing incoming: not listed. The local commits are already safe
+        # (grafted, and pushed when a fork remote exists), so surfacing the
+        # plugin here would only imply an action that doesn't exist.
+      done
     fi
-    exit 0
+
+    if (( ${#choices[@]} == 0 )); then
+      echo "No upstream changes waiting."
+      missing=0
+      for dir in "$PLUGINS_DIR"/*/; do
+        [[ -d $dir/.git ]] || continue
+        git -C "$dir" remote get-url upstream >/dev/null 2>&1 || missing=$((missing + 1))
+      done
+      if (( missing > 0 )); then
+        echo "$missing installed plugin$([ "$missing" = 1 ] || echo s) without an upstream remote — run 'omarchy-plugin-fork' to wire them up."
+      fi
+      exit 0
+    fi
+    interactive || fail "pass a plugin id, or run this interactively"
+    choice=$(printf '%s\n' "${choices[@]}" "── Set up fork upstreams…" "ALL of the above" | gum choose --header "Graft which plugin?")
+    if [[ $choice == "── Set up fork upstreams…" ]]; then
+      exec omarchy-plugin-fork
+    elif [[ $choice == "ALL of the above" ]]; then
+      targets=()
+      target_actions=()
+      for i in "${!choices[@]}"; do
+        targets+=("${choices[$i]% (*}")
+        target_actions+=("${actions[$i]}")
+      done
+    else
+      for i in "${!choices[@]}"; do
+        if [[ ${choices[$i]} == "$choice" ]]; then
+          targets=("${choices[$i]% (*}")
+          target_actions=("${actions[$i]}")
+          break
+        fi
+      done
+    fi
   fi
-  interactive || fail "pass a plugin id, or run this interactively"
-  choice=$(printf '%s\n' "${choices[@]}" "── Set up fork upstreams…" "ALL of the above" | gum choose --header "Graft which plugin?")
-  if [[ $choice == "── Set up fork upstreams…" ]]; then
-    exec omarchy-plugin-fork
-  elif [[ $choice == "ALL of the above" ]]; then
-    for c in "${choices[@]}"; do targets+=("${c% (*}"); done
-  else
-    targets+=("${choice% (*}")
-  fi
-fi
 
 rc=0
-for t in "${targets[@]}"; do
-  graft_one "$t" || rc=1
-  push_to_fork "$PLUGINS_DIR/$t" || rc=1
+for i in "${!targets[@]}"; do
+  t=${targets[i]}
+  if [[ ${target_actions[i]} == update ]]; then
+    if (( ASSUME_YES )); then
+      omarchy-plugin-update "$t" --yes || rc=1
+    else
+      omarchy-plugin-update "$t" || rc=1
+    fi
+  else
+    graft_one "$t" || rc=1
+    push_to_fork "$PLUGINS_DIR/$t" || rc=1
+  fi
 done
 
 exit $rc

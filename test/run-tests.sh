@@ -43,7 +43,8 @@ choose)
       echo "${lines[$tok]}"
     fi
   else
-    echo "${lines[0]}"
+    # Queue exhausted: pick the last entry ("Done") so menu loops terminate.
+    echo "${lines[${#lines[@]} - 1]}"
   fi
   ;;
 confirm)
@@ -71,9 +72,28 @@ cat >"$WORK/stubs/omarchy-shell" <<'STUB'
 #!/bin/bash
 exit 0
 STUB
+
+# Recording stub for the native updater: graft routes plain plugins
+# (origin = creator, no fork, no local commits) to it. It honors
+# OMARCHY_PLUGINS_DIR, which the real command hardcodes to
+# ~/.config/omarchy/plugins, and performs a real fast-forward so later
+# survey assertions see the synced state.
+cat >"$WORK/stubs/omarchy-plugin-update" <<'STUB'
+#!/bin/bash
+echo "update $*" >>"${FAKE_UPDATE_LOG:-/dev/null}"
+id=""
+for a in "$@"; do
+  case $a in --yes | -y) ;; *) id=$a ;; esac
+done
+dir="${OMARCHY_PLUGINS_DIR:?}/$id"
+git -C "$dir" fetch --quiet origin HEAD || exit 1
+git -C "$dir" merge --ff-only FETCH_HEAD >/dev/null 2>&1 || exit 1
+exit 0
+STUB
 chmod +x "$WORK/stubs"/*
 export PATH="$WORK/stubs:$PATH"
 export FAKE_GH_DIR="$WORK/gh"
+export FAKE_UPDATE_LOG="$WORK/update-stub.log"
 
 DIVERGED="$ROOT/bin/omarchy-plugin-diverged"
 GRAFT="$ROOT/bin/omarchy-plugin-graft"
@@ -197,12 +217,24 @@ check_eq "fetched attention exit 0" 0 "$?"
 echo "== graft: fast-forward =="
 make_plugin_origin p4 test.four
 clone_plugin p4 test.four
+git -C "$OMARCHY_PLUGINS_DIR/test.four" remote add upstream "$WORK/p4.git"
 upstream_commit p4 "upstream adds file" upstream-change
 "$GRAFT" test.four --yes >/dev/null
 check_eq "ff graft exit 0" 0 "$?"
 check_eq "ff graft moved to upstream tip" "upstream adds file" "$(git -C "$OMARCHY_PLUGINS_DIR/test.four" log -1 --format=%s)"
 "$DIVERGED" test.four >/dev/null
 check_eq "clean after ff (tracking ref recorded)" 1 "$?"
+
+echo "== graft: plain plugins route to the native updater =="
+# test.two is a clean plain clone (origin = creator, no upstream remote).
+# graft has nothing to replay for it, so it must defer to
+# 'omarchy plugin update' — the recording stub proves the handoff.
+"$GRAFT" test.two --yes >/dev/null
+check_eq "plain explicit id routed to update" yes \
+  "$(grep -q '^update test.two --yes$' "$FAKE_UPDATE_LOG" && echo yes)"
+"$GRAFT" --all --yes >/dev/null
+check_eq "plain --all routed to update" yes \
+  "$(grep -q '^update test.two --yes$' "$FAKE_UPDATE_LOG" && echo yes)"
 
 echo "== graft: rebase replay =="
 make_plugin_origin p5 test.five
@@ -268,6 +300,7 @@ rm "$OMARCHY_PLUGINS_DIR/test.seven/stray"
 echo "== graft: rollback when result fails validation =="
 make_plugin_origin p8 test.eight
 clone_plugin p8 test.eight
+git -C "$OMARCHY_PLUGINS_DIR/test.eight" remote add upstream "$WORK/p8.git"
 rm -rf "$WORK/tmpclone"
 git clone -q "$WORK/p8.git" "$WORK/tmpclone"
 (
@@ -329,25 +362,49 @@ echo "== graft: interactive chooser (pseudo-tty) =="
 # incoming must NOT be listed: give test.nine real incoming upstream work,
 # then "*" picks the last menu entry ("ALL of the above").
 upstream_commit p9 "upstream chooser tick" chooser-line
+upstream_commit pa "upstream plain tick" plain-line
+upstream_commit pf "upstream plain tick" plain-line
+# A clean plain plugin for the update-routing path: origin = creator, no
+# fork, no local commits — exactly what the native updater should handle.
+make_plugin_origin pf test.sixteen
+git clone -q "$WORK/pf.git" "$W3/test.sixteen"
+git -C "$W3/test.sixteen" config user.email t@t
+git -C "$W3/test.sixteen" config user.name T
 # Chooser runs against the isolated W3 zoo so candidate sets are known.
+# test.nine and test.ten carry local commits (graft); test.sixteen is a
+# clean plain plugin (routed to the native updater).
+git -C "$W3/test.nine" remote add upstream "$WORK/p9.git"
 export OMARCHY_PLUGINS_DIR="$W3"
 if command -v script >/dev/null 2>&1; then
   export FAKE_GUM_QUEUE="$WORK/chooser-queue"
   export FAKE_GUM_MENU="$WORK/chooser-menu"
-  # Select the test.nine entry (index 0) so its label shows in the output.
-  echo "0" >"$FAKE_GUM_QUEUE"
+  # Run 1: the plain-update entry is index 0, the carrier graft entry index 1.
+  printf '1\n' >"$FAKE_GUM_QUEUE"
   script -qec "$GRAFT" "$WORK/chooser-typescript" </dev/null >/dev/null
   tty_out="$(cat "$WORK/chooser-typescript")"
   menu_out="$(cat "$WORK/chooser-menu")"
-  check_eq "chooser listed the plugin with incoming commits" \
-    yes "$(grep -q 'test.nine (1 upstream commit waiting; 1 local)' <<<"$menu_out" && echo yes)"
-  check_eq "chooser skipped synced carriers" \
-    yes "$(grep -q 'test.ten' <<<"$menu_out" && echo no || echo yes)"
+  check_eq "chooser listed the plain update entry" yes \
+    "$(grep -q 'test.sixteen (1 upstream commit waiting; plain update — no local commits)' <<<"$menu_out" && echo yes)"
+  check_eq "chooser listed the carrier graft entry" yes \
+    "$(grep -q 'test.nine (1 upstream commit waiting; 1 local)' <<<"$menu_out" && echo yes)"
   check_eq "chooser offered the fork wizard" yes \
     "$(grep -q 'Set up fork upstreams' <<<"$menu_out" && echo yes)"
   check_eq "chooser ran the graft" yes "$(grep -q 'graft done for test.nine' <<<"$tty_out" && echo yes)"
   check_eq "chooser integrated the incoming commit" "upstream chooser tick" \
     "$(git -C "$W3/test.nine" log --format=%s -3 | grep 'upstream chooser tick')"
+  # Run 2: select the plain update entry (index 0) — routed to the native
+  # updater, which the stub performs as a real fast-forward.
+  printf '0\n' >"$FAKE_GUM_QUEUE"
+  script -qec "$GRAFT" "$WORK/chooser-typescript2" </dev/null >/dev/null
+  check_eq "chooser routed plain plugin to native update" yes \
+    "$(grep -q '^update test.sixteen$' "$FAKE_UPDATE_LOG" && echo yes)"
+  check_eq "native update fast-forwarded the plain plugin" "upstream plain tick" \
+    "$(git -C "$W3/test.sixteen" log -1 --format=%s)"
+  # Run 3: ALL grafts the remaining carrier (test.ten).
+  printf '*\n' >"$FAKE_GUM_QUEUE"
+  script -qec "$GRAFT" "$WORK/chooser-typescript3" </dev/null >/dev/null
+  check_eq "chooser ALL grafted the remaining carrier" "upstream plain tick" \
+    "$(git -C "$W3/test.ten" log --format=%s -3 | grep 'upstream plain tick')"
   unset FAKE_GUM_QUEUE FAKE_GUM_MENU
 else
   echo "  skip - script(1) unavailable"
