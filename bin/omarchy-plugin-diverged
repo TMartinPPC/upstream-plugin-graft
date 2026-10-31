@@ -27,6 +27,33 @@ valid_plugin_id() {
   [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $1 != *..* ]]
 }
 
+# Normalize a repo URL so the same repo compares equal across schemes:
+# git@host:path, ssh://, https://, .git suffix, case.
+norm_repo_url() {
+  local url="$1"
+  url=${url#ssh://}
+  url=${url#file://}
+  url=${url#https://}
+  url=${url#http://}
+  url=${url#git@}
+  url=${url#*@}
+  url=${url%.git}
+  url=${url//://}
+  url=${url%/}
+  printf '%s' "${url,,}"
+}
+
+# True when a remote named upstream exists and is NOT just another spelling
+# of origin — a mis-set upstream pointing at the same repo as origin would
+# make the survey compare the clone against itself.
+has_real_upstream() {
+  local dir="$1" up origin
+  git -C "$dir" remote get-url upstream >/dev/null 2>&1 || return 1
+  up=$(norm_repo_url "$(git -C "$dir" remote get-url upstream 2>/dev/null)") || return 1
+  origin=$(git -C "$dir" remote get-url origin 2>/dev/null) || return 0
+  [[ $up != "$(norm_repo_url "$origin")" ]]
+}
+
 # The remote ref standing for "the original creator's default branch tip".
 # A remote literally named upstream IS the fork declaration; its tracking
 # refs may not exist yet (added by the wizard, fetch failed), in which case
@@ -34,7 +61,7 @@ valid_plugin_id() {
 # unresolved until a graft fetches and records the tip.
 upstream_ref() {
   local dir="$1" ref=""
-  if git -C "$dir" remote get-url upstream >/dev/null 2>&1; then
+  if has_real_upstream "$dir"; then
     for ref in refs/remotes/upstream/HEAD refs/remotes/upstream/main refs/remotes/upstream/master; do
       if [[ -n $(git -C "$dir" rev-parse --verify --quiet "$ref" 2>/dev/null) ]]; then
         echo "$ref"

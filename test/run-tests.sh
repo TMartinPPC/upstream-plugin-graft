@@ -105,7 +105,7 @@ make_plugin_origin() { # $1 origin basename, $2 manifest id
   git init -q --bare -b main "$WORK/$1.git"
   git init -q -b main "$WORK/seed-$1"
   (
-    cd "$WORK/seed-$1"
+    cd "$WORK/seed-$1" || exit 1
     git config user.email t@t
     git config user.name T
     mkdir -p sub
@@ -135,18 +135,33 @@ ahead_commits() { # $1 plugin dir, $2 count, $3 message prefix
   done
 }
 
+make_fork_clone() { # $1 creator basename, $2 plugin id
+  # Model a real fork setup: origin = the user's fork (a bare copy of the
+  # creator at clone time), upstream = the creator repo. clone_plugin gives
+  # origin = creator; rename it to upstream and add a fork as origin.
+  make_plugin_origin "$1" "$2"
+  clone_plugin "$1" "$2"
+  git -C "$OMARCHY_PLUGINS_DIR/$2" remote rename origin upstream
+  git clone -q --bare "$WORK/$1.git" "$WORK/fork-$1.git"
+  git -C "$OMARCHY_PLUGINS_DIR/$2" remote add origin "$WORK/fork-$1.git"
+  git -C "$OMARCHY_PLUGINS_DIR/$2" fetch -q origin
+}
+
 upstream_commit() { # $1 origin basename, $2 message, $3 Service.qml content
+  # Guard hard: a failed clone must never let the commit land in whatever
+  # directory the suite happens to run from.
+  [[ -d $WORK/$1.git ]] || { echo "fixture: $WORK/$1.git does not exist" >&2; exit 1; }
   rm -rf "$WORK/tmpclone"
-  git clone -q "$WORK/$1.git" "$WORK/tmpclone"
+  git clone -q "$WORK/$1.git" "$WORK/tmpclone" || { echo "fixture: clone of $1.git failed" >&2; exit 1; }
   (
-    cd "$WORK/tmpclone"
+    cd "$WORK/tmpclone" || exit 1
     git config user.email t@t
     git config user.name T
     echo "$3" >sub/Service.qml
     git add .
     git commit -qm "$2"
     git push -q origin main
-  )
+  ) || { echo "fixture: upstream commit into $1.git failed" >&2; exit 1; }
   rm -rf "$WORK/tmpclone"
 }
 
@@ -215,9 +230,7 @@ check_eq "fetched attention exit 0" 0 "$?"
 # ---- graft -----------------------------------------------------------------
 
 echo "== graft: fast-forward =="
-make_plugin_origin p4 test.four
-clone_plugin p4 test.four
-git -C "$OMARCHY_PLUGINS_DIR/test.four" remote add upstream "$WORK/p4.git"
+make_fork_clone p4 test.four
 upstream_commit p4 "upstream adds file" upstream-change
 "$GRAFT" test.four --yes >/dev/null
 check_eq "ff graft exit 0" 0 "$?"
@@ -235,6 +248,41 @@ check_eq "plain explicit id routed to update" yes \
 "$GRAFT" --all --yes >/dev/null
 check_eq "plain --all routed to update" yes \
   "$(grep -q '^update test.two --yes$' "$FAKE_UPDATE_LOG" && echo yes)"
+
+echo "== graft: self-pointing upstream remote is ignored =="
+# A mis-set 'upstream' remote whose URL is just another spelling of origin
+# (same repo, different scheme) would make graft compare the clone against
+# itself: every local commit looks merged, every remote commit looks
+# incoming. The plugin must be treated as plain and routed to the native
+# updater instead.
+make_plugin_origin p15 test.fifteen
+clone_plugin p15 test.fifteen
+# Same repo under two spellings (file:// scheme vs bare path) — the guard
+# must normalize and treat the plugin as plain.
+git -C "$OMARCHY_PLUGINS_DIR/test.fifteen" remote add upstream "file://$WORK/p15.git"
+upstream_commit p15 "upstream self tick" self-line
+out=$("$DIVERGED" --fetch --json | jq -c '.[] | select(.id == "test.fifteen")')
+check_eq "self-upstream surveyed via origin" "upstream self tick" \
+  "$(git -C "$OMARCHY_PLUGINS_DIR/test.fifteen" log -1 --format=%s refs/remotes/origin/main)"
+check_eq "self-upstream flagged as incoming" 1 "$(jq -r '.incoming' <<<"$out")"
+"$GRAFT" test.fifteen --yes >/dev/null
+check_eq "self-upstream routed to native update" yes \
+  "$(grep -q '^update test.fifteen --yes$' "$FAKE_UPDATE_LOG" && echo yes)"
+check_eq "native update fast-forwarded past self-upstream" "upstream self tick" \
+  "$(git -C "$OMARCHY_PLUGINS_DIR/test.fifteen" log -1 --format=%s)"
+
+echo "== graft: rebased commits are pushed to the fork =="
+# With a real fork setup (origin = fork, upstream = creator), a successful
+# graft offers to push the rebased local commits to the fork; --yes accepts.
+make_fork_clone p17 test.seventeen
+ahead_commits "$OMARCHY_PLUGINS_DIR/test.seventeen" 1 fork-local
+upstream_commit p17 "upstream push tick" push-line
+out=$("$GRAFT" test.seventeen --yes 2>&1)
+check_eq "push graft exit 0" 0 "$?"
+check_eq "fork received the rebased commit" "fork-local 1" \
+  "$(git -C "$WORK/fork-p17.git" log -1 --format=%s)"
+check_eq "push summary reported" yes \
+  "$(grep -q 'graft done for test.seventeen' <<<"$out" && echo yes)"
 
 echo "== graft: rebase replay =="
 make_plugin_origin p5 test.five
@@ -298,9 +346,7 @@ check_eq "HEAD untouched by refusal" "local 1" "$(git -C "$OMARCHY_PLUGINS_DIR/t
 rm "$OMARCHY_PLUGINS_DIR/test.seven/stray"
 
 echo "== graft: rollback when result fails validation =="
-make_plugin_origin p8 test.eight
-clone_plugin p8 test.eight
-git -C "$OMARCHY_PLUGINS_DIR/test.eight" remote add upstream "$WORK/p8.git"
+make_fork_clone p8 test.eight
 rm -rf "$WORK/tmpclone"
 git clone -q "$WORK/p8.git" "$WORK/tmpclone"
 (

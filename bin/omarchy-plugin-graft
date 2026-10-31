@@ -49,13 +49,42 @@ valid_plugin_id() {
   [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $1 != *..* ]]
 }
 
+# Normalize a repo URL so the same repo compares equal across schemes:
+# git@host:path, ssh://, https://, .git suffix, case.
+norm_repo_url() {
+  local url="$1"
+  url=${url#ssh://}
+  url=${url#file://}
+  url=${url#https://}
+  url=${url#http://}
+  url=${url#git@}
+  url=${url#*@}
+  url=${url%.git}
+  url=${url//://}
+  url=${url%/}
+  printf '%s' "${url,,}"
+}
+
+# True when a remote named upstream exists and is NOT just another spelling
+# of origin. A mis-set upstream pointing at the same repo as origin would
+# make graft compare the clone against itself (everything local looks
+# merged, everything remote looks incoming) — ignore it and treat the
+# plugin as a plain clone.
+has_real_upstream() {
+  local dir="$1" up origin
+  git -C "$dir" remote get-url upstream >/dev/null 2>&1 || return 1
+  up=$(norm_repo_url "$(git -C "$dir" remote get-url upstream 2>/dev/null)") || return 1
+  origin=$(git -C "$dir" remote get-url origin 2>/dev/null) || return 0
+  [[ $up != "$(norm_repo_url "$origin")" ]]
+}
+
 # The remote ref standing for "the original creator's default branch tip".
 # A remote literally named upstream IS the fork declaration, even before its
 # tracking refs exist (the wizard adds it; a fetch may have failed) — graft
 # then fetches that remote name directly. Fallbacks cover plain clones.
 upstream_ref() {
   local dir="$1" ref=""
-  if git -C "$dir" remote get-url upstream >/dev/null 2>&1; then
+  if has_real_upstream "$dir"; then
     for ref in refs/remotes/upstream/HEAD refs/remotes/upstream/main refs/remotes/upstream/master; do
       if [[ -n $(git -C "$dir" rev-parse --verify --quiet "$ref" 2>/dev/null) ]]; then
         echo "$ref"
@@ -207,7 +236,7 @@ graft_one() {
 push_to_fork() {
   # Only offer when the fork is actually behind the local branch.
   local dir="$1" branch ahead
-  [[ -n $(git -C "$dir" remote get-url --quiet upstream 2>/dev/null) ]] || return 0
+  has_real_upstream "$dir" || return 0
   branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD)
   ahead=$(git -C "$dir" rev-list --count "refs/remotes/origin/$branch..HEAD" 2>/dev/null) || ahead=0
   (( ahead > 0 )) || return 0
@@ -217,8 +246,9 @@ push_to_fork() {
     return 0
   }
   if ! git -C "$dir" push --force-with-lease origin "HEAD:$branch"; then
+    # The graft itself succeeded; a failed push is a warning, not a failure.
     echo "omarchy-plugin-graft: push to fork failed; vanilla 'omarchy plugin update' will fail until you push" >&2
-    return 1
+    return 0
   fi
 }
 
@@ -290,7 +320,7 @@ targets=()
       NAME_AHEAD=0
       return 0
     fi
-    if git -C "$dir" remote get-url upstream >/dev/null 2>&1; then
+    if has_real_upstream "$dir"; then
       # Fork declaration exists: always a graft candidate, even when its
       # tracking refs were never fetched (wizard-added, fetch failed) —
       # the fetch in the chooser reveals what's actually waiting.
@@ -398,10 +428,10 @@ targets=()
       missing=0
       for dir in "$PLUGINS_DIR"/*/; do
         [[ -d $dir/.git ]] || continue
-        git -C "$dir" remote get-url upstream >/dev/null 2>&1 || missing=$((missing + 1))
+        has_real_upstream "$dir" || missing=$((missing + 1))
       done
       if (( missing > 0 )); then
-        echo "$missing installed plugin$([ "$missing" = 1 ] || echo s) without an upstream remote — run 'omarchy-plugin-fork' to wire them up."
+        echo "$missing installed plugin$([ "$missing" = 1 ] || echo s) with no fork setup — if you keep local changes in any of them, run 'omarchy-plugin-fork'."
       fi
       exit 0
     fi
