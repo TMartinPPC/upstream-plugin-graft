@@ -367,17 +367,18 @@ targets=()
       fi
     fi
   else
-    # Interactive chooser: plugins with something actionable. Paused rebases
-    # are always listed; plugins are listed only when a fetch shows new
-    # upstream commits. Carriers (fork plugins with local commits) graft;
-    # plain plugins route to 'omarchy plugin update'. Knowing "nothing
-    # incoming" requires the network, so candidates are fetched here — the
-    # badge stays no-network and counts carriers, the click window stays
-    # honest about action.
+    # Interactive chooser: graft candidates only. Plain plugins (origin is
+    # the creator, no local commits) are the native 'omarchy plugin update'
+    # territory — they appear as a single separated entry, not mixed into
+    # the graft list. Paused rebases are always listed; graft candidates
+    # are listed only when a fetch shows new upstream commits. Knowing
+    # "nothing incoming" requires the network, so candidates are fetched
+    # here — the badge stays no-network and counts graft-relevant plugins.
     choices=()
-    actions=() # parallel to choices: graft | update
+    actions=() # parallel to choices: graft
     names=()
     aheads=()
+    plain_pending=()
     for dir in "$PLUGINS_DIR"/*/; do
       [[ -d $dir/.git ]] || continue
       name=$(basename "$dir")
@@ -389,12 +390,12 @@ targets=()
         aheads+=("$NAME_AHEAD")
       else
         # Plain plugin: fetch origin (the creator repo) to see if anything
-        # is waiting, and hand it to the native updater when it is.
+        # is waiting. If it is, collect it for the separated native-update
+        # entry instead of listing it among graft candidates.
         if git -C "$dir" fetch --quiet origin HEAD; then
           incoming=$(git -C "$dir" rev-list --count HEAD..FETCH_HEAD 2>/dev/null || echo 0)
           if (( incoming > 0 )); then
-            choices+=("$name ($incoming upstream commit$([ "$incoming" = 1 ] || echo s) waiting; plain update — no local commits)")
-            actions+=(update)
+            plain_pending+=("$name")
           fi
         fi
       fi
@@ -423,7 +424,7 @@ targets=()
       done
     fi
 
-    if (( ${#choices[@]} == 0 )); then
+    if (( ${#choices[@]} == 0 && ${#plain_pending[@]} == 0 )); then
       echo "No upstream changes waiting."
       missing=0
       for dir in "$PLUGINS_DIR"/*/; do
@@ -435,10 +436,23 @@ targets=()
       fi
       exit 0
     fi
+    (( ${#choices[@]} == 0 )) && echo "No plugins need grafting — plain updates are listed below."
     interactive || fail "pass a plugin id, or run this interactively"
-    choice=$(printf '%s\n' "${choices[@]}" "── Set up fork upstreams…" "ALL of the above" | gum choose --header "Graft which plugin?")
+    menu=("${choices[@]}")
+    if (( ${#plain_pending[@]} > 0 )); then
+      menu+=("── Update ${#plain_pending[@]} plain plugin$([ ${#plain_pending[@]} = 1 ] || echo s) with 'omarchy plugin update' ──")
+    fi
+    menu+=("── Set up fork upstreams…")
+    if (( ${#choices[@]} > 0 )); then
+      menu+=("ALL of the above")
+    fi
+    choice=$(printf '%s\n' "${menu[@]}" | gum choose --header "Graft which plugin?")
     if [[ $choice == "── Set up fork upstreams…" ]]; then
       exec omarchy-plugin-fork
+    elif [[ $choice == "── Update "* ]]; then
+      targets=("${plain_pending[@]}")
+      target_actions=()
+      for _ in "${plain_pending[@]}"; do target_actions+=(update); done
     elif [[ $choice == "ALL of the above" ]]; then
       targets=()
       target_actions=()

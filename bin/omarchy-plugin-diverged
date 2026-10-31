@@ -4,13 +4,15 @@
 # omarchy:group=plugin
 # omarchy:args=[--json] [id...]
 
-# Surveys git-managed third-party plugins in ~/.config/omarchy/plugins that have
-# diverged from their clone point: local commits, an unclean working tree, or a
-# paused rebase. Purely local — git status and rev-list only, no fetch — so it
-# is fast enough for a bar widget to run on every shell start. Plugin authors
-# with a fork setup keep their creator repo on a remote named upstream; see
-# omarchy-plugin-fork. Upstream here always means "the remote that tracks the
-# original creator's default branch tip".
+# Surveys git-managed third-party plugins in ~/.config/omarchy/plugins that
+# need grafting: local commits, an unclean working tree, a paused rebase, or
+# (for fork setups) new upstream commits. Plain plugins whose origin is the
+# creator and that carry no local work are the native 'omarchy plugin update'
+# job and are not reported. Purely local — git status and rev-list only, no
+# fetch — so it is fast enough for a bar widget to run on every shell start.
+# Plugin authors with a fork setup keep their creator repo on a remote named
+# upstream; see omarchy-plugin-fork. Upstream here always means "the remote
+# that tracks the original creator's default branch tip".
 
 set -euo pipefail
 
@@ -85,10 +87,15 @@ upstream_ref() {
 # failed fetch keeps the last integrated tip). Without this the survey is
 # purely local and can only see what the last graft/fetch recorded.
 fetch_tips() {
-  local dir up remote
+  local dir up remote row ahead dirty rebasing fork
   for id in "${ids[@]}"; do
     dir="$PLUGINS_DIR/$id"
     [[ -d $dir/.git ]] || continue
+    row=$(survey_one "$id") || continue
+    IFS=$'\t' read -r _ _ ahead _ dirty rebasing fork <<<"$row"
+    # Plain plugins pending only a native update are not graft business;
+    # fetching their origin on every badge refresh is pure waste.
+    (( ! fork && ! ahead && ! dirty && ! rebasing )) && continue
     up=$(upstream_ref "$dir") || continue
     remote=${up#refs/remotes/}
     remote=${remote%%/*}
@@ -99,24 +106,25 @@ fetch_tips() {
 
 # Prints: id \t upstream-ref-or-unknown \t ahead(local) \t incoming \t dirty \t rebasing
 survey_one() {
-  local dir="$PLUGINS_DIR/$1" up="" ahead=0 incoming=0 dirty=0 rebasing=0
+  local dir="$PLUGINS_DIR/$1" up="" ahead=0 incoming=0 dirty=0 rebasing=0 fork=0
 
   git -C "$dir" diff --quiet 2>/dev/null && git -C "$dir" diff --cached --quiet 2>/dev/null \
     && [[ -z $(git -C "$dir" status --porcelain 2>/dev/null) ]] || dirty=1
 
   [[ -d $dir/.git/rebase-merge || -d $dir/.git/rebase-apply ]] && rebasing=1
+  has_real_upstream "$dir" && fork=1
 
   if up=$(upstream_ref "$dir"); then
     if [[ -z $(git -C "$dir" rev-parse --verify --quiet "$up" 2>/dev/null) ]]; then
       # Declared upstream whose tracking refs were never fetched.
-      printf '%s\tunknown\t0\t0\t%d\t%d\n' "$1" "$dirty" "$rebasing"
+      printf '%s\tunknown\t0\t0\t%d\t%d\t%d\n' "$1" "$dirty" "$rebasing" "$fork"
       return 0
     fi
     ahead=$(git -C "$dir" rev-list --count "$up..HEAD" 2>/dev/null) || ahead=0
     incoming=$(git -C "$dir" rev-list --count "HEAD..$up" 2>/dev/null) || incoming=0
-    printf '%s\t%s\t%d\t%d\t%d\t%d\n' "$1" "$up" "$ahead" "$incoming" "$dirty" "$rebasing"
+    printf '%s\t%s\t%d\t%d\t%d\t%d\t%d\n' "$1" "$up" "$ahead" "$incoming" "$dirty" "$rebasing" "$fork"
   else
-    printf '%s\tunknown\t0\t0\t%d\t%d\n' "$1" "$dirty" "$rebasing"
+    printf '%s\tunknown\t0\t0\t%d\t%d\t%d\n' "$1" "$dirty" "$rebasing" "$fork"
   fi
 }
 
@@ -159,13 +167,15 @@ Usage: omarchy plugin diverged [--fetch] [--json] [id...]
 Surveys installed git-managed plugins for upstream commits waiting to be
 grafted, uncommitted changes, or a paused graft rebase. Plugins that merely
 carry local commits (already grafted, nothing waiting) are NOT reported.
+Plain plugins — origin is the creator, no local work — waiting on a normal
+update are also NOT reported: that is 'omarchy plugin update' territory.
 
 Purely local by default: no network, so it only sees upstream tips as of
-the last graft or fetch. --fetch refreshes each candidate's upstream tip
-first (same bookkeeping graft uses), which makes "nothing waiting"
-trustworthy; use it for bar-widget scans. --json emits only the plugins
-that need attention. Exits 0 when at least one plugin needs attention,
-1 when none do.
+the last graft or fetch. --fetch refreshes the upstream tip of every
+graft-relevant plugin first (same bookkeeping graft uses), which makes
+"nothing waiting" trustworthy; use it for bar-widget scans. --json emits
+only the plugins that need attention. Exits 0 when at least one plugin
+needs attention, 1 when none do.
 USAGE
     exit 0
     ;;
@@ -196,8 +206,17 @@ fi
 needs=0
 (( DO_FETCH )) && fetch_tips
 
-attention() { # up ahead incoming dirty rebasing
-  (( $3 > 0 || $4 || $5 )) || [[ $1 == unknown ]]
+attention() { # up ahead incoming dirty rebasing fork
+  # Graft-relevant: unclean tree, paused rebase, or unresolvable state;
+  # incoming work on a fork setup; or incoming work on a plugin with local
+  # commits (a carrier the native updater would refuse). A plain plugin
+  # (origin is the creator, no local work) waiting on a normal update is
+  # the native 'omarchy plugin update' job — it does not light the badge,
+  # and neither does a synced carrier.
+  (( $4 || $5 )) && return 0
+  [[ $1 == unknown ]] && return 0
+  (( $3 > 0 && ($6 || $2 > 0) )) && return 0
+  return 1
 }
 
 if (( AS_JSON )); then
@@ -205,8 +224,8 @@ if (( AS_JSON )); then
   # subshell and lose the needs counter (and thus the exit code).
   records=()
   for id in "${ids[@]}"; do
-    IFS=$'\t' read -r id up ahead incoming dirty rebasing <<<"$(survey_one "$id")"
-    if attention "$up" "$ahead" "$incoming" "$dirty" "$rebasing"; then
+    IFS=$'\t' read -r id up ahead incoming dirty rebasing fork <<<"$(survey_one "$id")"
+    if attention "$up" "$ahead" "$incoming" "$dirty" "$rebasing" "$fork"; then
       records+=("$(json_record "$id" "$up" "$ahead" "$incoming" "$dirty" "$rebasing")")
       needs=$((needs + 1))
     fi
@@ -218,8 +237,8 @@ if (( AS_JSON )); then
   fi
 else
   for id in "${ids[@]}"; do
-    IFS=$'\t' read -r id up ahead incoming dirty rebasing <<<"$(survey_one "$id")"
-    if attention "$up" "$ahead" "$incoming" "$dirty" "$rebasing"; then
+    IFS=$'\t' read -r id up ahead incoming dirty rebasing fork <<<"$(survey_one "$id")"
+    if attention "$up" "$ahead" "$incoming" "$dirty" "$rebasing" "$fork"; then
       text_record "$id" "$up" "$ahead" "$incoming" "$dirty" "$rebasing"
       needs=$((needs + 1))
     fi

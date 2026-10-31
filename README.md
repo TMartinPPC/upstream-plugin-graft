@@ -20,13 +20,16 @@ after graft: A---B---E---F (upstream 1.4)
 
 - `bin/` — the CLI, installed into `~/.local/bin`:
   - `omarchy-plugin-diverged [--fetch] [--json] [id...]` — survey of
-    installed git-cloned plugins that need attention: upstream commits
-    waiting to be grafted, uncommitted changes, or a paused graft rebase.
-    Plugins that merely carry local commits (already grafted, nothing
-    waiting) are not reported. Exit 0 when at least one needs attention,
-    1 when none do (like `omarchy-update-available`). Without `--fetch` it
-    is purely local and sees upstream tips only as of the last graft;
-    `--fetch` refreshes each candidate's tip first (what the bar widget
+    installed git-cloned plugins that need *grafting*: upstream commits
+    waiting on a fork setup, uncommitted changes, local commits, or a
+    paused graft rebase. Plugins that merely carry local commits (already
+    grafted, nothing waiting) are not reported, and neither are plain
+    plugins (origin is the creator, no local work) that only need a normal
+    update — that is `omarchy plugin update` territory and does not light
+    the badge. Exit 0 when at least one needs attention, 1 when none do
+    (like `omarchy-update-available`). Without `--fetch` it is purely
+    local and sees upstream tips only as of the last graft; `--fetch`
+    refreshes each graft-relevant plugin's tip first (what the bar widget
     uses, so "nothing waiting" is trustworthy).
   - `omarchy-plugin-graft <id | --all> [--yes]` — fetch the creator's
     default-branch tip, review what's incoming, then:
@@ -36,11 +39,11 @@ after graft: A---B---E---F (upstream 1.4)
       the rebase — resolve, `git add`, and re-run the same command to continue
     - fork setups (`upstream` remote, see below): offers to force-with-lease
       push replayed commits back to your fork after grafting
-    - run with no id for an interactive picker that fetches the plugins
-      carrying local commits and lists only the ones with incoming work
-      (plus a shortcut into the fork setup wizard); plain plugins (origin
-      is the creator, no fork, no local commits) are handed to the native
-      `omarchy plugin update` instead of being grafted
+    - run with no id for an interactive picker that lists graft candidates
+      (plugins with local commits and incoming upstream work) plus two
+      separated actions: one entry that runs the native
+      `omarchy plugin update` for every plain plugin with pending updates,
+      and a shortcut into the fork setup wizard
   - `omarchy-plugin-fork <id> [--yes]` — escape hatch: `gh repo fork` the
     origin, rename `origin` → `upstream`, point `origin` at your fork, push
     your local commits. Then vanilla `omarchy plugin update` works again

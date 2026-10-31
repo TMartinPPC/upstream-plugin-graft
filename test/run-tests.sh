@@ -227,6 +227,25 @@ check_eq "fetched ahead is local count" 2 "$(jq -r '.[0].ahead' <<<"$out")"
 "$DIVERGED" --fetch test.fourteen >/dev/null
 check_eq "fetched attention exit 0" 0 "$?"
 
+echo "== diverged: plain plugins are the native updater's job =="
+# A clean plain plugin (origin = creator, no local work) with incoming
+# commits must NOT light the badge — 'omarchy plugin update' owns it.
+# Graft-relevant states (dirty, local commits) still count.
+make_plugin_origin p18 test.eighteen
+clone_plugin p18 test.eighteen
+upstream_commit p18 "upstream plain tick" plain-line
+out=$("$DIVERGED" --json test.eighteen)
+check_eq "plain plugin with incoming not flagged" "[]" "$out"
+"$DIVERGED" test.eighteen >/dev/null
+check_eq "plain plugin with incoming exit 1" 1 "$?"
+touch "$OMARCHY_PLUGINS_DIR/test.eighteen/stray"
+out=$("$DIVERGED" --json test.eighteen)
+check_eq "dirty plain plugin still flagged" true "$(jq -r '.[0].dirty' <<<"$out")"
+rm "$OMARCHY_PLUGINS_DIR/test.eighteen/stray"
+# --fetch must not spend network on plain plugins either.
+out=$("$DIVERGED" --fetch --json test.eighteen)
+check_eq "plain plugin skipped by fetch survey too" "[]" "$out"
+
 # ---- graft -----------------------------------------------------------------
 
 echo "== graft: fast-forward =="
@@ -261,10 +280,11 @@ clone_plugin p15 test.fifteen
 # must normalize and treat the plugin as plain.
 git -C "$OMARCHY_PLUGINS_DIR/test.fifteen" remote add upstream "file://$WORK/p15.git"
 upstream_commit p15 "upstream self tick" self-line
-out=$("$DIVERGED" --fetch --json | jq -c '.[] | select(.id == "test.fifteen")')
-check_eq "self-upstream surveyed via origin" "upstream self tick" \
-  "$(git -C "$OMARCHY_PLUGINS_DIR/test.fifteen" log -1 --format=%s refs/remotes/origin/main)"
-check_eq "self-upstream flagged as incoming" 1 "$(jq -r '.incoming' <<<"$out")"
+# The plugin must read as plain end-to-end: no attention in the survey, and
+# the graft window hands it to the native updater instead of grafting.
+out=$("$DIVERGED" --fetch --json)
+check_eq "self-upstream plugin not flagged" "[]" \
+  "$(jq -c '[.[] | select(.id == "test.fifteen")]' <<<"$out")"
 "$GRAFT" test.fifteen --yes >/dev/null
 check_eq "self-upstream routed to native update" yes \
   "$(grep -q '^update test.fifteen --yes$' "$FAKE_UPDATE_LOG" && echo yes)"
@@ -424,29 +444,34 @@ export OMARCHY_PLUGINS_DIR="$W3"
 if command -v script >/dev/null 2>&1; then
   export FAKE_GUM_QUEUE="$WORK/chooser-queue"
   export FAKE_GUM_MENU="$WORK/chooser-menu"
-  # Run 1: the plain-update entry is index 0, the carrier graft entry index 1.
-  printf '1\n' >"$FAKE_GUM_QUEUE"
+  # Menu layout: graft candidates first, then the separated plain-update
+  # entry, the fork wizard, and "ALL of the above" last.
+  # Run 1: index 2 = the separated plain-update entry (graft candidates
+  # test.nine and test.ten come first). Runs the native updater for every
+  # pending plain plugin; the stub fast-forwards.
+  printf '2\n' >"$FAKE_GUM_QUEUE"
   script -qec "$GRAFT" "$WORK/chooser-typescript" </dev/null >/dev/null
-  tty_out="$(cat "$WORK/chooser-typescript")"
   menu_out="$(cat "$WORK/chooser-menu")"
-  check_eq "chooser listed the plain update entry" yes \
-    "$(grep -q 'test.sixteen (1 upstream commit waiting; plain update — no local commits)' <<<"$menu_out" && echo yes)"
   check_eq "chooser listed the carrier graft entry" yes \
     "$(grep -q 'test.nine (1 upstream commit waiting; 1 local)' <<<"$menu_out" && echo yes)"
+  check_eq "chooser keeps plain plugins out of the graft list" yes \
+    "$(grep -q 'plain update — no local commits' <<<"$menu_out" || echo yes)"
+  check_eq "chooser offered the separated plain-update entry" yes \
+    "$(grep -q "Update 1 plain plugin with 'omarchy plugin update'" <<<"$menu_out" && echo yes)"
   check_eq "chooser offered the fork wizard" yes \
     "$(grep -q 'Set up fork upstreams' <<<"$menu_out" && echo yes)"
-  check_eq "chooser ran the graft" yes "$(grep -q 'graft done for test.nine' <<<"$tty_out" && echo yes)"
-  check_eq "chooser integrated the incoming commit" "upstream chooser tick" \
-    "$(git -C "$W3/test.nine" log --format=%s -3 | grep 'upstream chooser tick')"
-  # Run 2: select the plain update entry (index 0) — routed to the native
-  # updater, which the stub performs as a real fast-forward.
-  printf '0\n' >"$FAKE_GUM_QUEUE"
-  script -qec "$GRAFT" "$WORK/chooser-typescript2" </dev/null >/dev/null
-  check_eq "chooser routed plain plugin to native update" yes \
+  check_eq "chooser routed plain plugins to native update" yes \
     "$(grep -q '^update test.sixteen$' "$FAKE_UPDATE_LOG" && echo yes)"
   check_eq "native update fast-forwarded the plain plugin" "upstream plain tick" \
     "$(git -C "$W3/test.sixteen" log -1 --format=%s)"
-  # Run 3: ALL grafts the remaining carrier (test.ten).
+  # Run 2: index 0 = the test.nine graft candidate.
+  printf '0\n' >"$FAKE_GUM_QUEUE"
+  script -qec "$GRAFT" "$WORK/chooser-typescript2" </dev/null >/dev/null
+  tty_out="$(cat "$WORK/chooser-typescript2")"
+  check_eq "chooser ran the graft" yes "$(grep -q 'graft done for test.nine' <<<"$tty_out" && echo yes)"
+  check_eq "chooser integrated the incoming commit" "upstream chooser tick" \
+    "$(git -C "$W3/test.nine" log --format=%s -3 | grep 'upstream chooser tick')"
+  # Run 3: "*" picks the last menu entry — ALL grafts the remaining carrier.
   printf '*\n' >"$FAKE_GUM_QUEUE"
   script -qec "$GRAFT" "$WORK/chooser-typescript3" </dev/null >/dev/null
   check_eq "chooser ALL grafted the remaining carrier" "upstream plain tick" \
